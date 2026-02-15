@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast  # AMP 추가
 from torchvision import models, transforms
 import cv2
 import os
@@ -10,13 +11,14 @@ from tqdm import tqdm
 import argparse
 
 # ==========================================
-# ⚙️ 설정
+# ⚙️ 설정 (수정됨: 112 -> 224 통일)
 # ==========================================
 BASE_DIR = "C:/Users/leejy/Desktop/test_experiment/dataset"
 SEQUENCE_LENGTH = 16
-IMG_SIZE = 112  # R3D, R(2+1)D 모델의 표준 입력 사이즈
+IMG_SIZE = 224  # 🚨 핵심 수정: 112 -> 224로 상향 (Spatial과 통일)
+BATCH_SIZE = 4  # 해상도가 커졌으므로 배치 사이즈 조절 (VRAM 12GB~24GB 기준 안정값)
 
-# R3D 및 R(2+1)D를 위한 정규화 값 (Kinetics-400 데이터셋 기준)
+# R3D/R2+1D 입력용 정규화
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -24,9 +26,6 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.43216, 0.394666, 0.37645], std=[0.22803, 0.22145, 0.216989])
 ])
 
-# ==========================================
-# 📂 데이터셋 클래스
-# ==========================================
 class VideoSequenceDataset(Dataset):
     def __init__(self, data_dir, sequence_length=16, transform=None):
         self.data_dir = data_dir
@@ -37,7 +36,6 @@ class VideoSequenceDataset(Dataset):
         real_dir = os.path.join(data_dir, "real")
         fake_dir = os.path.join(data_dir, "fake")
         
-        # mp4 파일만 골라내어 샘플 리스트 생성
         if os.path.exists(real_dir):
             for f in os.listdir(real_dir):
                 if f.lower().endswith('.mp4'): self.samples.append((os.path.join(real_dir, f), 0))
@@ -53,7 +51,6 @@ class VideoSequenceDataset(Dataset):
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # 랜덤한 시점에서 시퀀스 추출
         start_frame = 0
         if total_frames > self.seq_len:
             start_frame = np.random.randint(0, total_frames - self.seq_len)
@@ -63,7 +60,6 @@ class VideoSequenceDataset(Dataset):
         for _ in range(self.seq_len):
             ret, frame = cap.read()
             if not ret:
-                # 프레임 부족 시 검은 화면으로 패딩
                 frame = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
             else:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -72,15 +68,12 @@ class VideoSequenceDataset(Dataset):
             frames.append(frame)
         cap.release()
         
-        # VideoMAE와 달리 (C, T, H, W) 형식이 필요함
+        # (C, T, H, W) 형식
         frames = torch.stack(frames).permute(1, 0, 2, 3) 
         return frames, label
 
-# ==========================================
-# 🏗️ 모델 빌드 함수
-# ==========================================
 def get_model(model_name, device):
-    print(f"🏗️ 모델 빌드 중: {model_name.upper()}...")
+    print(f"🏗️ 모델 빌드 중: {model_name.upper()} (Input: 224x224)...")
     if model_name == "r3d":
         model = models.video.r3d_18(weights=models.video.R3D_18_Weights.KINETICS400_V1)
     elif model_name == "r2plus1d":
@@ -91,11 +84,7 @@ def get_model(model_name, device):
     model.fc = nn.Linear(model.fc.in_features, 2)
     return model.to(device)
 
-# ==========================================
-# 🔥 학습 핵심 함수
-# ==========================================
 def train_model(model_type, dataset_name, epochs=5):
-    # 폴더 구조 매칭 수정 (2번, 2_train_mixed, 2_train_worst 반영)
     folder_map = {
         "pure": os.path.join("2_exp_train_pure", "train"),
         "mixed": "2_train_mixed",
@@ -110,16 +99,17 @@ def train_model(model_type, dataset_name, epochs=5):
     
     data_path = os.path.join(BASE_DIR, target_folder)
     dataset = VideoSequenceDataset(data_path, SEQUENCE_LENGTH, transform)
+    
     if len(dataset) == 0:
         print(f"❌ 데이터 없음: {data_path}")
         return
     
-    # RTX 4070 SUPER 12GB 기준으로 배치 사이즈 8이 안정적입니다.
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     model = get_model(model_type, device)
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    scaler = GradScaler() # AMP Scaler
     
     model.train()
     for epoch in range(epochs):
@@ -128,10 +118,15 @@ def train_model(model_type, dataset_name, epochs=5):
             inputs, labels = inputs.to(device), labels.to(device)
             
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            
+            # AMP 적용 (메모리 절약 및 속도 향상)
+            with autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             loop.set_postfix(loss=loss.item())
             
