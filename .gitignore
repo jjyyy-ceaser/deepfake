@@ -1,0 +1,7 @@
+# 대용량 데이터 및 모델 제외
+data/
+dataset/
+*.pth
+*.h5
+*.mp4
+*.zip
