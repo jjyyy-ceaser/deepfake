@@ -22,7 +22,7 @@ BATCH_LIST = [32]
 MAE_BATCH_LIST = [8]
 LR_LIST = [1e-4, 5e-5, 1e-5]
 
-NUM_WORKERS = 2
+NUM_WORKERS = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def get_data(dataset_name):
