@@ -119,7 +119,7 @@ def train_model(model_type, dataset_name, epochs=5):
             
             optimizer.zero_grad()
             
-            # AMP 적용 (메모리 절약 및 속도 향상)
+            # AMP 적용 (메모리 절약 및 속도 향상)     m    
             with autocast():
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
