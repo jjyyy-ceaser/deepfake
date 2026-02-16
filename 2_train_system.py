@@ -74,7 +74,7 @@ def run_experiment():
             is_mae = 'mae' in model_name
             
             # --- [Step 1] Grid Search (Fold 0 only) ---
-            print("    🔎 Grid Search...", end="")
+            print("    🔎 Grid Search...", end="", flush=True)
             best_auc = -1
             best_params = {}
             train_idx, val_idx = next(skf.split(files, labels)) # Fold 0
