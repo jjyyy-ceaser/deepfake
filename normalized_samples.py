@@ -1,27 +1,25 @@
-import os
 import subprocess
+from tqdm import tqdm
+import os
 
-input_dir = "./raw_samples"
-output_dir = "./normalized_samples"
-
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
-
-for filename in os.listdir(input_dir):
-    if filename.endswith((".mp4", ".mov", ".mkv")):
-        input_path = os.path.join(input_dir, filename)
-        output_path = os.path.join(output_dir, f"std_{filename}")
+def normalize_videos(input_folder, output_folder):
+    files = [f for f in os.listdir(input_folder) if f.endswith('.mp4')]
+    
+    # 진행 상황을 한눈에 볼 수 있는 tqdm 적용
+    for file in tqdm(files, desc="정규화 진행 중"):
+        input_path = os.path.join(input_folder, file)
+        output_path = os.path.join(output_folder, f"std_{file}")
         
-        # FFmpeg 명령어 실행
-        cmd = [
+        # CPU 점유율을 고려한 'slower' 프리셋 활용
+        command = [
             'ffmpeg', '-i', input_path,
-            '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30',
+            '-vf', 'scale=1920:1080,fps=30',
             '-t', '10',
-            '-c:v', 'libx264', '-crf', '0', '-preset', 'veryslow',
-            '-c:a', 'copy', output_path, '-y'
+            '-c:v', 'libx264', '-crf', '18', '-preset', 'slower',
+            '-y', output_path
         ]
         
-        print(f"Processing: {filename}...")
-        subprocess.run(cmd)
+        # 에러 로그를 확인하며 실행
+        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-print("정규화 완료!")
+print("준비 완료. 가상환경에서 스크립트를 실행하세요.")
