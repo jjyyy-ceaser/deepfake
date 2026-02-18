@@ -1,0 +1,4 @@
+Fold 1 | Ep 1 | Loss: 0.7039 | AUC: 0.4049
+Fold 1 | Ep 1 | Loss: 0.7000 | AUC: 0.5315
+Fold 1 | Ep 2 | Loss: 0.6742 | AUC: 0.5130
+Fold 1 | Ep 1 | AUC: 0.4401
