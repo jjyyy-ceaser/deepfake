@@ -7,6 +7,7 @@ from torchvision import transforms
 import cv2
 import os
 import random
+import gc
 import numpy as np
 from tqdm import tqdm
 import argparse
@@ -14,6 +15,17 @@ import timm
 
 BASE_DIR = "C:/Users/leejy/Desktop/test_experiment/dataset"
 IMG_SIZE = 224
+
+# 📌 [최적 파라미터]
+BEST_PARAMS = {
+    'xception': 5e-5,
+    'convnext': 1e-4,
+    'swin': 5e-5
+}
+
+def clean_memory():
+    gc.collect()
+    torch.cuda.empty_cache()
 
 transform = transforms.Compose([
     transforms.ToPILImage(),
@@ -59,18 +71,23 @@ def get_model(model_name, device):
     return model.to(device)
 
 def train_model(model_type, dataset_name, epochs=5):
+    clean_memory()
     folder_map = {"pure": os.path.join("2_exp_train_pure", "train"), "mixed": "2_train_mixed", "worst": "2_train_worst"}
     data_path = os.path.join(BASE_DIR, folder_map[dataset_name])
     
+    print(f"🔥 [Spatial 학습 시작] 모델: {model_type} | 데이터셋: {dataset_name} (Dataset B)")
     dataset = VideoFrameDataset(data_path, transform=transform)
     if len(dataset) == 0: return
         
     batch_size = 32
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
+                            num_workers=8, pin_memory=True, 
+                            prefetch_factor=2, persistent_workers=True)
     
     model = get_model(model_type, torch.device("cuda"))
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    lr = BEST_PARAMS.get(model_type, 1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     scaler = GradScaler()
     
     model.train()
@@ -86,18 +103,22 @@ def train_model(model_type, dataset_name, epochs=5):
             scaler.step(optimizer)
             scaler.update()
             loop.set_postfix(loss=loss.item())
+        clean_memory()
             
     torch.save(model.state_dict(), f"model_spatial_{model_type}_{dataset_name}.pth")
     print(f"✅ 저장 완료: model_spatial_{model_type}_{dataset_name}.pth")
+    del model, optimizer, scaler
+    clean_memory()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="all")
-    parser.add_argument("--dataset", type=str, default="all")
+    # 🚨 [수정됨] 기본값을 'mixed' (Dataset B)로 변경하여 이것만 실행
+    parser.add_argument("--dataset", type=str, default="mixed") 
     args = parser.parse_args()
     
     target_models = ["xception", "convnext", "swin"] if args.model == "all" else [args.model]
-    target_datasets = ["pure", "mixed", "worst"] if args.dataset == "all" else [args.dataset]
+    target_datasets = ["mixed"] if args.dataset == "mixed" else [args.dataset] 
     
     for m in target_models:
         for d in target_datasets:

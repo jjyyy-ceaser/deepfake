@@ -23,7 +23,7 @@ NUM_EPOCHS = 30       # 충분한 학습을 위해 30으로 설정 (Early Stoppi
 PATIENCE = 5          # 5번 연속 성능 향상 없으면 조기 종료
 BATCH_SIZE_SPATIAL = 32
 BATCH_SIZE_TEMPORAL = 16 # VRAM 안전값
-NUM_WORKERS = 0       # 윈도우 환경 충돌 방지
+NUM_WORKERS = 2       # 윈도우 환경 충돌 방지
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 🏆 Grid Search로 찾은 최적의 LR (Learning Rates)
@@ -135,7 +135,7 @@ def train_one_fold(fold_idx, train_files, train_labels, val_files, val_labels, m
                 break
                 
     # 메모리 정리
-    del model, optimizer, scaler
+    del model, optimizer, scaler   
     torch.cuda.empty_cache()
     gc.collect()
     

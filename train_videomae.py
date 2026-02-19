@@ -6,6 +6,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torchvision import transforms
 import cv2
 import os
+import gc
 import numpy as np
 from tqdm import tqdm
 import argparse
@@ -22,6 +23,11 @@ transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
+
+def clean_memory():
+    """✨ 메모리 세탁 기능 ✨"""
+    gc.collect()
+    torch.cuda.empty_cache()
 
 class VideoSequenceDataset(Dataset):
     def __init__(self, data_dir, sequence_length=16, transform=None):
@@ -53,17 +59,24 @@ class VideoSequenceDataset(Dataset):
         return frames, label
 
 def train_videomae(dataset_name, epochs=5):
+    clean_memory()
     folder_map = {"pure": os.path.join("2_exp_train_pure", "train"), "mixed": "2_train_mixed", "worst": "2_train_worst"}
     data_path = os.path.join(BASE_DIR, folder_map[dataset_name])
     dataset = VideoSequenceDataset(data_path, SEQUENCE_LENGTH, transform)
     if len(dataset) == 0: return
     
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
     device = torch.device("cuda")
+    
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
+                            num_workers=8, pin_memory=True, 
+                            prefetch_factor=2, persistent_workers=True)
     
     print(f"🔥 [VideoMAE 학습] 데이터셋: {dataset_name.upper()}")
     model = VideoMAEForVideoClassification.from_pretrained("MCG-NJU/videomae-base", num_labels=2, ignore_mismatched_sizes=True).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=2e-5)
+    
+    # 📌 Transformer 권장 최적 LR 적용 (5e-5)
+    print(f"⚙️ 적용된 Learning Rate: 5e-5")
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5)
     scaler = GradScaler()
     
     model.train()
@@ -85,13 +98,20 @@ def train_videomae(dataset_name, epochs=5):
             logits = outputs.logits
             acc = (logits.argmax(1) == labels).float().mean().item() * 100
             loop.set_postfix(loss=loss.item(), acc=acc)
+        
+        clean_memory() # 에포크 종료 후 청소
             
     torch.save(model.state_dict(), f"model_temporal_videomae_{dataset_name}.pth")
     print(f"✅ 저장 완료")
+    del model, optimizer, scaler
+    clean_memory()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="all")
+    # 🚨 [수정됨] 기본값 'mixed'
+    parser.add_argument("--dataset", type=str, default="mixed")
     args = parser.parse_args()
-    datasets = ["pure", "mixed", "worst"] if args.dataset == "all" else [args.dataset]
-    for d in datasets: train_videomae(d, epochs=5)
+    
+    datasets = ["mixed"] if args.dataset == "mixed" else [args.dataset]
+    for d in datasets: 
+        train_videomae(d, epochs=5)
