@@ -6,6 +6,7 @@ import math
 import numpy as np
 import cv2
 import pandas as pd
+import json  # JSON 파싱을 위해 추가
 from tqdm import tqdm
 
 # =========================================================
@@ -23,7 +24,7 @@ TARGET_PLATFORMS = [
 ]
 
 # =========================================================
-# 🛠️ 함수 정의 (복붙 실수 방지를 위해 한 덩어리로 제공)
+# 🛠️ 함수 정의
 # =========================================================
 
 def parse_mp4_atoms(file_path):
@@ -51,30 +52,56 @@ def parse_mp4_atoms(file_path):
     return "-".join(atoms)
 
 def get_video_metadata(file_path):
-    """FFprobe로 메타데이터 추출"""
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-           "-show_entries", "stream=width,height,codec_name,profile,avg_frame_rate,bit_rate", 
-           "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+    """FFprobe를 JSON 모드로 실행하여 데이터 밀림 현상을 완벽 차단"""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0", 
+        "-show_entries", "stream=width,height,codec_name,profile,avg_frame_rate,bit_rate", 
+        "-show_entries", "format=bit_rate,duration", # 비트레이트 누락 방지를 위해 format 정보 추가
+        "-of", "json", file_path
+    ]
     try:
-        output = subprocess.check_output(cmd).decode('utf-8').strip().split('\n')
-        if len(output) < 6: return None
+        output = subprocess.check_output(cmd).decode('utf-8')
+        data = json.loads(output)
         
-        width = int(output[0]) if output[0].isdigit() else 0
-        height = int(output[1]) if output[1].isdigit() else 0
-        codec = output[2]
-        profile = output[3]
+        if 'streams' not in data or len(data['streams']) == 0:
+            return None
+            
+        stream = data['streams'][0]
+        fmt = data.get('format', {})
         
-        fps_val = output[4]
+        # 1. 해상도 및 코덱 (Key 직접 접근)
+        width = int(stream.get('width', 0))
+        height = int(stream.get('height', 0))
+        codec = stream.get('codec_name', 'unknown')
+        profile = stream.get('profile', 'unknown')
+        
+        # 2. FPS 계산 (예: "30000/1001" 처리)
+        fps_val = stream.get('avg_frame_rate', '0/0')
         if '/' in fps_val:
-            num, den = fps_val.split('/')
-            fps = float(num) / float(den)
+            num, den = map(float, fps_val.split('/'))
+            fps = num / den if den != 0 else 0
         else:
             fps = float(fps_val)
             
-        bitrate = int(output[5]) if output[5].isdigit() else 0
+        # 3. 비트레이트 (스트림 -> 포맷 -> 직접 계산 순으로 탐색)
+        bitrate = int(stream.get('bit_rate', 0))
+        if bitrate == 0:
+            bitrate = int(fmt.get('bit_rate', 0))
+            
+        # 극한의 상황 (플랫폼이 비트레이트 메타데이터를 지웠을 때) 파일 크기로 역산
+        if bitrate == 0:
+            file_size = os.path.getsize(file_path)
+            duration = float(fmt.get('duration', 10.0))
+            if duration > 0:
+                bitrate = int((file_size * 8) / duration)
         
-        return {"width": width, "height": height, "codec": codec, "profile": profile, "fps": fps, "bitrate": bitrate}
+        return {
+            "width": width, "height": height, 
+            "codec": codec, "profile": profile, 
+            "fps": fps, "bitrate": bitrate
+        }
     except Exception as e:
+        print(f"⚠️ Metadata Error ({file_path}): {e}")
         return None
 
 def estimate_crf(orig_bitrate, dist_bitrate):
@@ -113,7 +140,6 @@ def main():
         print(f"❌ 원본 폴더를 찾을 수 없습니다: {ORIGINAL_DIR}")
         return
 
-    # 원본 파일 목록 (S01_ORG.mp4 ...)
     orig_files = sorted(glob.glob(os.path.join(ORIGINAL_DIR, "*.mp4")))
     results = []
     
@@ -122,30 +148,25 @@ def main():
     for orig_path in tqdm(orig_files, desc="Total Progress"):
         orig_filename = os.path.basename(orig_path)
         
-        # 파일명에서 Index 추출 (S01_ORG.mp4 -> S01)
         if "_" in orig_filename:
             file_index = orig_filename.split('_')[0] 
         else:
-            print(f"⚠️ 파일명 형식 오류 (Skip): {orig_filename}")
             continue
 
         orig_meta = get_video_metadata(orig_path)
         if not orig_meta: continue
 
-        # 각 플랫폼별 대응 파일 찾기
         for info in TARGET_PLATFORMS:
             platform_folder = os.path.join(BASE_DIR, info["folder"])
-            target_filename = f"{file_index}_{info['tag']}.mp4" # 예: S01_KK_HQ.mp4
+            target_filename = f"{file_index}_{info['tag']}.mp4"
             dist_path = os.path.join(platform_folder, target_filename)
             
             if not os.path.exists(dist_path):
-                # 파일이 없으면 조용히 넘어감 (해당 플랫폼 테스트 안 했을 수도 있으니)
                 continue
             
             dist_meta = get_video_metadata(dist_path)
             if not dist_meta: continue
             
-            # 분석 수행
             box_seq = parse_mp4_atoms(dist_path)
             est_crf = estimate_crf(orig_meta['bitrate'], dist_meta['bitrate'])
             blockiness = measure_block_artifact(dist_path)
@@ -163,7 +184,6 @@ def main():
                 "Bitrate_Loss(%)": round((1 - dist_meta['bitrate']/orig_meta['bitrate'])*100, 1)
             })
 
-    # CSV 저장
     df = pd.DataFrame(results)
     save_path = os.path.join(BASE_DIR, "final_forensic_report.csv")
     df.to_csv(save_path, index=False)
@@ -171,11 +191,6 @@ def main():
     print("\n" + "="*50)
     print(f"🎉 분석 완료! 리포트 저장됨: {save_path}")
     print("="*50)
-    
-    if not df.empty:
-        print(df.groupby("Platform")[["Est_CRF", "Blockiness", "Bitrate_Loss(%)"]].mean())
-    else:
-        print("⚠️ 결과 데이터가 없습니다. 파일명이나 폴더 경로를 확인해주세요.")
 
 if __name__ == "__main__":
     main()
