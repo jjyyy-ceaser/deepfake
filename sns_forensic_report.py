@@ -1,62 +1,29 @@
 import os
-import struct
 import subprocess
-import glob
 import math
 import numpy as np
 import cv2
 import pandas as pd
-import json  # JSON 파싱을 위해 추가
+import json
 from tqdm import tqdm
 
 # =========================================================
-# 📂 설정: Rename 코드와 100% 동일한 구조
+# 📂 설정: Case 1(원본)과 Case 4(변형) 비교를 위한 경로 지정
 # =========================================================
-BASE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\sns_analysis"
-ORIGINAL_DIR = os.path.join(BASE_DIR, "0_original")
+BASE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\processed_cases\train"
 
-# 분석 대상 플랫폼 리스트 (폴더명, 태그)
-TARGET_PLATFORMS = [
-    {"folder": "1_youtube",       "tag": "YT"},
-    {"folder": "2_instagram",     "tag": "IG"},
-    {"folder": "3_kakao_normal",  "tag": "KK_NM"},
-    {"folder": "3_kakao_high",    "tag": "KK_HQ"}
-]
+# Case 1을 원본으로, Case 4를 비교 대상으로 설정
+ORIGINAL_DIR = os.path.join(BASE_DIR, r"case1_original\real")
+DISTORTED_DIR = os.path.join(BASE_DIR, r"case4_mixed\real")
 
 # =========================================================
-# 🛠️ 함수 정의
+# 🛠️ 핵심 분석 함수 (유지)
 # =========================================================
-
-def parse_mp4_atoms(file_path):
-    """MP4 구조(Box Sequence) 추출"""
-    atoms = []
-    try:
-        file_size = os.path.getsize(file_path)
-        with open(file_path, "rb") as f:
-            while f.tell() < file_size:
-                size_bytes = f.read(4)
-                type_bytes = f.read(4)
-                if len(size_bytes) < 4 or len(type_bytes) < 4: break
-                
-                atom_size = struct.unpack(">I", size_bytes)[0]
-                atom_type = type_bytes.decode('utf-8', errors='ignore')
-                
-                if atom_type.isalnum(): atoms.append(atom_type)
-                
-                if atom_size == 0: break 
-                if atom_size == 1: 
-                    f.seek(8, 1)
-                    if atom_type == 'mdat': break
-                else: f.seek(atom_size - 8, 1)
-    except Exception: return "Error"
-    return "-".join(atoms)
-
 def get_video_metadata(file_path):
-    """FFprobe를 JSON 모드로 실행하여 데이터 밀림 현상을 완벽 차단"""
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0", 
         "-show_entries", "stream=width,height,codec_name,profile,avg_frame_rate,bit_rate", 
-        "-show_entries", "format=bit_rate,duration", # 비트레이트 누락 방지를 위해 format 정보 추가
+        "-show_entries", "format=bit_rate,duration",
         "-of", "json", file_path
     ]
     try:
@@ -69,13 +36,10 @@ def get_video_metadata(file_path):
         stream = data['streams'][0]
         fmt = data.get('format', {})
         
-        # 1. 해상도 및 코덱 (Key 직접 접근)
         width = int(stream.get('width', 0))
         height = int(stream.get('height', 0))
         codec = stream.get('codec_name', 'unknown')
-        profile = stream.get('profile', 'unknown')
         
-        # 2. FPS 계산 (예: "30000/1001" 처리)
         fps_val = stream.get('avg_frame_rate', '0/0')
         if '/' in fps_val:
             num, den = map(float, fps_val.split('/'))
@@ -83,12 +47,10 @@ def get_video_metadata(file_path):
         else:
             fps = float(fps_val)
             
-        # 3. 비트레이트 (스트림 -> 포맷 -> 직접 계산 순으로 탐색)
         bitrate = int(stream.get('bit_rate', 0))
         if bitrate == 0:
             bitrate = int(fmt.get('bit_rate', 0))
             
-        # 극한의 상황 (플랫폼이 비트레이트 메타데이터를 지웠을 때) 파일 크기로 역산
         if bitrate == 0:
             file_size = os.path.getsize(file_path)
             duration = float(fmt.get('duration', 10.0))
@@ -97,22 +59,19 @@ def get_video_metadata(file_path):
         
         return {
             "width": width, "height": height, 
-            "codec": codec, "profile": profile, 
-            "fps": fps, "bitrate": bitrate
+            "codec": codec, "fps": fps, "bitrate": bitrate
         }
     except Exception as e:
         print(f"⚠️ Metadata Error ({file_path}): {e}")
         return None
 
 def estimate_crf(orig_bitrate, dist_bitrate):
-    """비트레이트 기반 CRF 추정"""
     if orig_bitrate == 0 or dist_bitrate == 0: return 0
     ratio = orig_bitrate / dist_bitrate
     if ratio < 1: ratio = 1
     return round(18 + (6 * math.log2(ratio)), 2)
 
 def measure_block_artifact(file_path):
-    """8x8 블록 노이즈 측정"""
     cap = cv2.VideoCapture(file_path)
     if not cap.isOpened(): return 0.0
     
@@ -135,62 +94,69 @@ def measure_block_artifact(file_path):
     
     return round((block_energy_h + block_energy_v) / (non_block_h + non_block_v + 1e-6), 4)
 
+# =========================================================
+# 🚀 검증 실행 로직
+# =========================================================
 def main():
     if not os.path.exists(ORIGINAL_DIR):
-        print(f"❌ 원본 폴더를 찾을 수 없습니다: {ORIGINAL_DIR}")
+        print(f"❌ 원본 폴더(Case 1)를 찾을 수 없습니다: {ORIGINAL_DIR}")
         return
-
-    orig_files = sorted(glob.glob(os.path.join(ORIGINAL_DIR, "*.mp4")))
+        
+    orig_files = [f for f in os.listdir(ORIGINAL_DIR) if f.endswith('.mp4')]
     results = []
     
-    print(f"🕵️ Forensic Report 시작: 원본 {len(orig_files)}개 분석")
+    print(f"🕵️ Case 4 타당성 검증 시작: 총 {len(orig_files)}개 파일 분석")
     
-    for orig_path in tqdm(orig_files, desc="Total Progress"):
-        orig_filename = os.path.basename(orig_path)
+    for filename in tqdm(orig_files, desc="Validation Progress"):
+        orig_path = os.path.join(ORIGINAL_DIR, filename)
+        dist_path = os.path.join(DISTORTED_DIR, filename)
         
-        if "_" in orig_filename:
-            file_index = orig_filename.split('_')[0] 
-        else:
+        # Case 4 파일이 존재하는지 확인
+        if not os.path.exists(dist_path):
             continue
 
         orig_meta = get_video_metadata(orig_path)
-        if not orig_meta: continue
+        dist_meta = get_video_metadata(dist_path)
+        
+        if not orig_meta or not dist_meta: 
+            continue
+            
+        est_crf = estimate_crf(orig_meta['bitrate'], dist_meta['bitrate'])
+        blockiness = measure_block_artifact(dist_path)
+        bitrate_loss = round((1 - dist_meta['bitrate'] / orig_meta['bitrate']) * 100, 1)
+        
+        results.append({
+            "Filename": filename,
+            "Target": "CASE4_MIXED",
+            "Orig_Res": f"{orig_meta['width']}x{orig_meta['height']}",
+            "Dist_Res": f"{dist_meta['width']}x{dist_meta['height']}",
+            "Orig_Bitrate": orig_meta['bitrate'],
+            "Dist_Bitrate": dist_meta['bitrate'],
+            "Est_CRF": est_crf,
+            "Blockiness": blockiness,
+            "Bitrate_Loss(%)": bitrate_loss
+        })
 
-        for info in TARGET_PLATFORMS:
-            platform_folder = os.path.join(BASE_DIR, info["folder"])
-            target_filename = f"{file_index}_{info['tag']}.mp4"
-            dist_path = os.path.join(platform_folder, target_filename)
-            
-            if not os.path.exists(dist_path):
-                continue
-            
-            dist_meta = get_video_metadata(dist_path)
-            if not dist_meta: continue
-            
-            box_seq = parse_mp4_atoms(dist_path)
-            est_crf = estimate_crf(orig_meta['bitrate'], dist_meta['bitrate'])
-            blockiness = measure_block_artifact(dist_path)
-            
-            results.append({
-                "Index": file_index,
-                "Platform": info["folder"].upper(),
-                "Orig_Res": f"{orig_meta['width']}x{orig_meta['height']}",
-                "Dist_Res": f"{dist_meta['width']}x{dist_meta['height']}",
-                "FPS_Diff": round(orig_meta['fps'] - dist_meta['fps'], 2),
-                "Codec": dist_meta['codec'],
-                "Box_Sequence": box_seq,
-                "Est_CRF": est_crf,
-                "Blockiness": blockiness,
-                "Bitrate_Loss(%)": round((1 - dist_meta['bitrate']/orig_meta['bitrate'])*100, 1)
-            })
-
-    df = pd.DataFrame(results)
-    save_path = os.path.join(BASE_DIR, "final_forensic_report.csv")
-    df.to_csv(save_path, index=False)
-    
-    print("\n" + "="*50)
-    print(f"🎉 분석 완료! 리포트 저장됨: {save_path}")
-    print("="*50)
+    if results:
+        df = pd.DataFrame(results)
+        
+        # 전체 평균 수치 도출
+        avg_loss = df["Bitrate_Loss(%)"].mean()
+        avg_crf = df["Est_CRF"].mean()
+        avg_block = df["Blockiness"].mean()
+        
+        print("\n" + "="*50)
+        print("📊 [Case 4 검증 결과 요약]")
+        print(f"평균 비트레이트 손실률: {avg_loss:.1f}% (목표: 유튜브 93.6%)")
+        print(f"평균 추정 CRF: {avg_crf:.1f} (목표: 유튜브 44.9)")
+        print(f"평균 Blockiness: {avg_block:.4f} (목표: 유튜브 1.198)")
+        print("="*50)
+        
+        save_path = os.path.join(BASE_DIR, "case4_validation_report.csv")
+        df.to_csv(save_path, index=False)
+        print(f"✅ 리포트 저장 완료: {save_path}")
+    else:
+        print("⚠️ 분석할 매칭 파일이 없습니다. 경로를 다시 확인해주세요.")
 
 if __name__ == "__main__":
     main()

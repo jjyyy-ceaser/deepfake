@@ -12,19 +12,19 @@ from torchvision import transforms
 from torch.cuda.amp import GradScaler, autocast
 
 # ==========================================
-# ⚙️ Final Grid Search 설정 (정석 모드)
+# ⚙️ Final Grid Search 설정 (VideoMAE 전용 모드)
 # ==========================================
 TARGET_DATASET = "dataset_B_mixed" 
 LR_LIST = [1e-4, 5e-5, 1e-5]
 NUM_WORKERS = 0 
 DEVICE = torch.device("cuda")
 
-# [정석 수정] 1 Epoch은 너무 짧음. 3 Epoch으로 늘려 신뢰도 확보
+# 1 Epoch은 너무 짧음. 3 Epoch으로 늘려 신뢰도 확보 (기존과 동일)
 TEST_EPOCHS = 3 
 
-# 모델 그룹 분류
-SPATIAL_MODELS = ["xception", "convnext", "swin"]
-TEMPORAL_MODELS = ["r3d", "r2plus1d"]
+# [수정 포인트 1] VideoMAE 모델만 탐색하도록 그룹 재설정
+SPATIAL_MODELS = []
+TEMPORAL_MODELS = ["videomae"]
 
 def get_group_config(group_name):
     if group_name == 'TEMPORAL':
@@ -43,6 +43,9 @@ def get_group_config(group_name):
         return tf, 32
 
 def run_grid_search_group(models, group_name):
+    if not models:
+        return []
+
     print(f"\n🚀 Starting Grid Search Group: {group_name} (Epochs: {TEST_EPOCHS})")
     tf, bs = get_group_config(group_name)
     
@@ -79,7 +82,7 @@ def run_grid_search_group(models, group_name):
                 
                 best_epoch_auc = 0.0
                 
-                # [정석 수정] 에포크 반복 루프 추가
+                # 에포크 반복 루프 (기존과 동일)
                 for ep in range(TEST_EPOCHS):
                     model.train()
                     for x, y in tqdm(l_tr, desc=f"    LR={lr} | Ep={ep+1}", leave=False, ncols=80):
@@ -104,7 +107,7 @@ def run_grid_search_group(models, group_name):
                     
                     epoch_auc = roc_auc_score(trues, preds) if len(set(trues)) > 1 else 0.5
                     
-                    # 3번 중 가장 잘 나온 점수를 기록 (학습 가능성 확인)
+                    # 3번 중 가장 잘 나온 점수를 기록
                     if epoch_auc > best_epoch_auc:
                         best_epoch_auc = epoch_auc
                 
@@ -129,15 +132,33 @@ if __name__ == "__main__":
     except: pass
     
     final_res = []
+    
+    # 공간적 모델 리스트는 비어있으므로 바로 통과됩니다.
     final_res.extend(run_grid_search_group(SPATIAL_MODELS, "SPATIAL"))
     
     torch.cuda.empty_cache()
     gc.collect()
     
+    # 시간적 모델(VideoMAE) 탐색 수행
     final_res.extend(run_grid_search_group(TEMPORAL_MODELS, "TEMPORAL"))
     
+    # [수정 포인트 2] 기존 결과를 덮어쓰지 않고 안전하게 '이어 쓰기(Append)'
     if final_res:
-        pd.DataFrame(final_res).to_csv("grid_search_master_results.csv", index=False)
-        print("\n💾 정석 실험 완료! 'grid_search_master_results.csv' 저장됨.")
+        csv_file = "grid_search_master_results.csv"
+        new_df = pd.DataFrame(final_res)
+        
+        if os.path.exists(csv_file):
+            # 1. 기존 CSV 파일 읽어오기
+            existing_df = pd.read_csv(csv_file)
+            # 2. 혹시 이전에 실행하다 중단된 videomae 기록이 있다면 삭제하여 중복 방지
+            existing_df = existing_df[existing_df['Model'] != 'videomae']
+            # 3. 기존 기록 밑에 새로운 videomae 기록 붙이기
+            updated_df = pd.concat([existing_df, new_df], ignore_index=True)
+            updated_df.to_csv(csv_file, index=False)
+            print(f"\n💾 성공: 기존 '{csv_file}' 파일에 VideoMAE의 LR과 AUC 결과가 안전하게 이어 쓰기 되었습니다.")
+        else:
+            # 파일이 없을 경우 새로 생성
+            new_df.to_csv(csv_file, index=False)
+            print(f"\n💾 새로운 '{csv_file}' 파일이 생성되어 저장되었습니다.")
     else:
-        print("\n⚠️ 결과가 없습니다.")
+        print("\n⚠️ 기록할 결과가 없습니다.")
