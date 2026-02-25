@@ -14,10 +14,10 @@ import argparse
 import timm
 from sklearn.model_selection import StratifiedKFold
 
-# 📂 [경로 고정]
-BASE_DIR = "C:/Users/leejy/Desktop/test_experiment/dataset/final_datasets"
+# 📂 [경로 고정 - Dataset A Train 135쌍]
+TRAIN_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\split_datasets\dataset_A\train"
 
-# 📌 [최적 파라미터]
+# 📌 [최적 파라미터 - 그리드 서치 결과 반영]
 BEST_PARAMS = {
     'xception': 5e-5,
     'convnext': 1e-4,
@@ -28,7 +28,43 @@ def clean_memory():
     gc.collect()
     torch.cuda.empty_cache()
 
-transform = transforms.Compose([
+# 📌 [1] 얼리 스토핑 클래스 정의
+class EarlyStopping:
+    def __init__(self, patience=3, path='checkpoint.pth'):
+        self.patience = patience
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        self.path = path
+
+    def __call__(self, val_loss, model):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.save_checkpoint(model)
+        elif val_loss > self.best_loss:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.save_checkpoint(model)
+            self.counter = 0
+
+    def save_checkpoint(self, model):
+        torch.save(model.state_dict(), self.path)
+
+# 📌 [2] 학습용(증강 O)과 검증용(증강 X) Transform 분리
+train_transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.RandomRotation(degrees=10),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+val_transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -62,46 +98,47 @@ def get_model(model_name, device):
     elif model_name == "swin": model = timm.create_model('swin_tiny_patch4_window7_224', pretrained=True, num_classes=2)
     return model.to(device)
 
-def train_model(model_type, dataset_name, epochs=5): # 📌 Epoch 5로 상향
+def train_model(model_type, epochs=15):
     clean_memory()
-    folder_map = {
-        "pure": "dataset_A_pure", 
-        "mixed": "dataset_B_mixed", 
-        "worst": "dataset_C_worst"
-    }
-    data_path = os.path.join(BASE_DIR, folder_map[dataset_name])
-    print(f"🔥 [Spatial 5-Fold] 모델: {model_type} | 데이터: {dataset_name}")
+    print(f"🔥 [Spatial 5-Fold] 모델: {model_type} | 학습 데이터: Dataset A Train")
 
     all_samples = []
-    real_dir, fake_dir = os.path.join(data_path, "real"), os.path.join(data_path, "fake")
+    real_dir, fake_dir = os.path.join(TRAIN_DIR, "real"), os.path.join(TRAIN_DIR, "fake")
     if os.path.exists(real_dir): all_samples += [(os.path.join(real_dir, f), 0) for f in os.listdir(real_dir) if f.endswith('.mp4')]
     if os.path.exists(fake_dir): all_samples += [(os.path.join(fake_dir, f), 1) for f in os.listdir(fake_dir) if f.endswith('.mp4')]
-    
+
     if len(all_samples) == 0:
-        print(f"❌ 데이터 없음: {data_path}")
+        print(f"❌ 데이터 없음: {TRAIN_DIR}")
         return
 
-    # 📌 5-Fold 적용 (n_splits=5)
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     y = [s[1] for s in all_samples]
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(all_samples, y)):
-        print(f"  🔄 Fold {fold+1}/5 Start...")
+        print(f"\n🔄 Fold {fold+1}/5 Start...")
         
         train_samples = [all_samples[i] for i in train_idx]
-        val_samples = [all_samples[i] for i in val_idx] # Validation용 (여기선 학습에 집중)
+        val_samples = [all_samples[i] for i in val_idx]
         
-        train_ds = VideoFrameDataset(train_samples, transform=transform)
+        train_ds = VideoFrameDataset(train_samples, transform=train_transform)
+        val_ds = VideoFrameDataset(val_samples, transform=val_transform)
+        
+        # 📌 고성능 데이터 로더 세팅 이식
         train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
+        val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
         
         model = get_model(model_type, torch.device("cuda"))
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=BEST_PARAMS.get(model_type, 1e-4))
         scaler = GradScaler()
         
-        model.train()
+        save_path = f"model_spatial_{model_type}_fold{fold+1}.pth"
+        early_stopping = EarlyStopping(patience=3, path=save_path)
+        
         for epoch in range(epochs):
-            loop = tqdm(train_loader, desc=f"Fold {fold+1} Ep {epoch+1}", leave=False)
+            model.train()
+            train_loss = 0.0
+            loop = tqdm(train_loader, desc=f"Fold {fold+1} Ep {epoch+1} Train", leave=False)
             for inputs, labels in loop:
                 inputs, labels = inputs.cuda(), labels.cuda()
                 optimizer.zero_grad()
@@ -111,20 +148,36 @@ def train_model(model_type, dataset_name, epochs=5): # 📌 Epoch 5로 상향
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+                train_loss += loss.item()
                 loop.set_postfix(loss=loss.item())
-        
-        torch.save(model.state_dict(), f"model_spatial_{model_type}_{dataset_name}_fold{fold+1}.pth")
-        print(f"    ✅ Fold {fold+1} 저장 완료")
-        del model, optimizer, scaler, train_loader
+            
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.cuda(), labels.cuda()
+                    with autocast():
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+                    val_loss += loss.item()
+            
+            t_loss = train_loss / len(train_loader)
+            v_loss = val_loss / len(val_loader)
+            print(f"   - Epoch {epoch+1}: Train Loss = {t_loss:.4f}, Val Loss = {v_loss:.4f}")
+            
+            early_stopping(v_loss, model)
+            if early_stopping.early_stop:
+                print("   ⏹️ Validation Loss 개선 없음. 조기 종료합니다.")
+                break
+                
+        print(f"    ✅ Fold {fold+1} 완료 (Best Model 저장됨: {save_path})")
+        del model, optimizer, scaler, train_loader, val_loader, train_ds, val_ds
         clean_memory()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="all")
-    parser.add_argument("--dataset", type=str, default="all") 
     args = parser.parse_args()
     target_models = ["xception", "convnext", "swin"] if args.model == "all" else [args.model]
-    target_datasets = ["pure", "mixed", "worst"] if args.dataset == "all" else [args.dataset]
     for m in target_models:
-        for d in target_datasets:
-            train_model(m, d, epochs=5) # 📌 Epoch 5 호출
+        train_model(m, epochs=15)
