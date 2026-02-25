@@ -9,7 +9,7 @@ import timm
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 from transformers import VideoMAEForVideoClassification
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from tqdm import tqdm
 
 # =====================================================================
@@ -132,7 +132,7 @@ class FinalTestDataset(Dataset):
             return torch.stack(frames).permute(1, 0, 2, 3), path 
 
 # =====================================================================
-# 4. 종합 평가 메인 루프 (엑셀 저장 포함)
+# 4. 종합 평가 메인 루프 (5대 지표 및 엑셀 저장 포함)
 # =====================================================================
 def start_evaluation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,7 +177,7 @@ def start_evaluation():
                     model.load_state_dict(torch.load(w_path, map_location=device))
                     model.to(device).eval()
                     
-                    # 데이터 로더 최적 세팅 (num_workers=4, pin_memory=True)
+                    # 데이터 로더 최적 세팅
                     loader = DataLoader(FinalTestDataset(test_files, config), batch_size=4, num_workers=4, pin_memory=True)
                     
                     probs = []
@@ -191,23 +191,33 @@ def start_evaluation():
                             probs.extend(torch.softmax(outputs, dim=1)[:, 1].cpu().numpy())
                     
                     preds = [1 if p > 0.5 else 0 for p in probs]
-                    fold_res.append({"acc": accuracy_score(labels, preds), "auc": roc_auc_score(labels, probs), "f1": f1_score(labels, preds, zero_division=0)})
+                    
+                    # 5대 평가 지표 모두 산출 (zero_division 에러 방지 포함)
+                    fold_res.append({
+                        "acc": accuracy_score(labels, preds), 
+                        "auc": roc_auc_score(labels, probs), 
+                        "f1": f1_score(labels, preds, zero_division=0),
+                        "pre": precision_score(labels, preds, zero_division=0),
+                        "rec": recall_score(labels, preds, zero_division=0)
+                    })
                     del model; clean_memory() # ✨ 메모리 즉각 해제
 
-                # 5-Fold 평균 요약
+                # 5-Fold 평균 요약 및 5대 지표 병합
                 if fold_res:
                     final_report.append({
                         "Model": m_name, "Case": mc, "Platform": pf_label,
                         "Acc": np.mean([x['acc'] for x in fold_res]),
                         "AUC": np.mean([x['auc'] for x in fold_res]),
-                        "F1": np.mean([x['f1'] for x in fold_res])
+                        "F1": np.mean([x['f1'] for x in fold_res]),
+                        "Precision": np.mean([x['pre'] for x in fold_res]),
+                        "Recall": np.mean([x['rec'] for x in fold_res])
                     })
 
-    # 📊 엑셀 파일(.xlsx)로 출력 (pandas의 to_excel 사용)
+    # 📊 엑셀 파일(.xlsx)로 출력
     df_report = pd.DataFrame(final_report)
     output_excel_path = "Final_Robustness_Analysis.xlsx"
     df_report.to_excel(output_excel_path, index=False)
-    print(f"\n✅ 모든 평가가 완료되었습니다. '{output_excel_path}' 파일에서 결과를 확인하십시오.")
+    print(f"\n✅ 모든 평가가 완료되었습니다. '{output_excel_path}' 파일에서 5대 지표 결과를 확인하십시오.")
 
 if __name__ == "__main__":
     start_evaluation()
