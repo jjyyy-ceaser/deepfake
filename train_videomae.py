@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 import cv2
@@ -20,7 +19,6 @@ SEQUENCE_LENGTH = 16
 IMG_SIZE = 224
 BATCH_SIZE = 4 
 
-# 📌 [최적 파라미터]
 BEST_LR = 1e-4
 
 base_transform = transforms.Compose([
@@ -74,14 +72,8 @@ class VideoSequenceDataset(Dataset):
         
         frames = []
         
-        if self.is_train:
-            apply_hflip = random.random() > 0.5
-            brightness_factor = random.uniform(0.8, 1.2)
-            contrast_factor = random.uniform(0.8, 1.2)
-        else:
-            apply_hflip = False
-            brightness_factor = 1.0
-            contrast_factor = 1.0
+        # 📌 [증강 스펙 다운] 좌우 반전 확률만 남김
+        apply_hflip = (random.random() > 0.5) if self.is_train else False
         
         for _ in range(self.seq_len):
             ret, cap_frame = cap.read()
@@ -95,8 +87,6 @@ class VideoSequenceDataset(Dataset):
             
             if apply_hflip:
                 pil_img = TF.hflip(pil_img)
-            pil_img = TF.adjust_brightness(pil_img, brightness_factor)
-            pil_img = TF.adjust_contrast(pil_img, contrast_factor)
             
             if self.transform: 
                 frame_tensor = self.transform(pil_img)
@@ -133,14 +123,13 @@ def train_videomae(epochs=15):
         train_ds = VideoSequenceDataset(train_samples, SEQUENCE_LENGTH, base_transform, is_train=True)
         val_ds = VideoSequenceDataset(val_samples, SEQUENCE_LENGTH, base_transform, is_train=False)
         
-        # 📌 고성능 데이터 로더 세팅 이식
         train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
         val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
         
         device = torch.device("cuda")
         model = VideoMAEForVideoClassification.from_pretrained("MCG-NJU/videomae-base", num_labels=2, ignore_mismatched_sizes=True).to(device)
         optimizer = optim.AdamW(model.parameters(), lr=BEST_LR)
-        scaler = GradScaler()
+        scaler = torch.amp.GradScaler('cuda') # ✅ Warning 해결
         
         save_path = f"model_temporal_videomae_fold{fold+1}.pth"
         early_stopping = EarlyStopping(patience=3, path=save_path)
@@ -154,7 +143,7 @@ def train_videomae(epochs=15):
                 inputs = inputs.permute(0, 2, 1, 3, 4) 
                 
                 optimizer.zero_grad()
-                with autocast():
+                with torch.amp.autocast('cuda'): # ✅ Warning 해결
                     outputs = model(pixel_values=inputs, labels=labels)
                     loss = outputs.loss
                 scaler.scale(loss).backward()
@@ -169,7 +158,7 @@ def train_videomae(epochs=15):
                 for inputs, labels in val_loader:
                     inputs, labels = inputs.to(device), labels.to(device)
                     inputs = inputs.permute(0, 2, 1, 3, 4) 
-                    with autocast():
+                    with torch.amp.autocast('cuda'): # ✅ Warning 해결
                         outputs = model(pixel_values=inputs, labels=labels)
                         loss = outputs.loss
                     val_loss += loss.item()
@@ -189,4 +178,3 @@ def train_videomae(epochs=15):
 
 if __name__ == "__main__":
     train_videomae(epochs=15)
-    
