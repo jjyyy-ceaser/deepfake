@@ -70,4 +70,4 @@ class UnifiedDataset(Dataset):
 
         except Exception:
             if cap: cap.release()
-            return torch.zeros((3, IMG_SIZE, IMG_SIZE)) if self.model_type == 'spatial' else torch.zeros((3, SEQ_LEN, IMG_SIZE, IMG_SIZE)), label
+            return torch.zeros((3, IMG_SIZE, IMG_SIZE)) if self.model_type == 'spatial' else torch.zeros((3, SEQ_LEN, IMG_SIZE, IMG_SIZE)), labelpy
