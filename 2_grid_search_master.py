@@ -11,18 +11,18 @@ from utils import DeepfakeDataset, get_model
 from torchvision import transforms
 
 # ==========================================
-# ⚙️ Final Grid Search 설정 (VideoMAE 전용 모드)
+# ⚙️ Final Grid Search 설정 (6개 모델 전체 탐색 + 초고속 로딩)
 # ==========================================
-TARGET_DATASET = "dataset_B_mixed" 
-LR_LIST = [1e-4, 5e-5, 1e-5]
-NUM_WORKERS = 0 
+BASE_DIR = "C:/Users/leejy/Desktop/test_experiment/dataset/final_datasets"
+TARGET_DATASET = "dataset_A_pure"  # 📌 학습과 동일한 Dataset A 고정
+
+LR_LIST = [1e-5, 5e-6, 1e-6]       # 📌 극소 학습률 적용
+NUM_WORKERS = 8                    # 📌 CPU 코어 풀가동 설정
 DEVICE = torch.device("cuda")
+TEST_EPOCHS = 5 
 
-TEST_EPOCHS = 3 
-
-# VideoMAE 모델만 탐색하도록 그룹 재설정
-SPATIAL_MODELS = []
-TEMPORAL_MODELS = ["videomae"]
+SPATIAL_MODELS = ["xception", "convnext", "swin"]
+TEMPORAL_MODELS = ["r3d", "r2plus1d", "videomae"]
 
 def get_group_config(group_name):
     if group_name == 'TEMPORAL':
@@ -47,7 +47,7 @@ def run_grid_search_group(models, group_name):
     print(f"\n🚀 Starting Grid Search Group: {group_name} (Epochs: {TEST_EPOCHS})")
     tf, bs = get_group_config(group_name)
     
-    base = os.path.join("dataset", "final_datasets", TARGET_DATASET)
+    base = os.path.join(BASE_DIR, TARGET_DATASET)
     real = glob.glob(os.path.join(base, "real", "*"))
     fake = glob.glob(os.path.join(base, "fake", "*"))
     
@@ -70,14 +70,29 @@ def run_grid_search_group(models, group_name):
         
         for lr in LR_LIST:
             try:
-                l_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True, num_workers=NUM_WORKERS)
-                l_val = DataLoader(ds_val, batch_size=bs, shuffle=False, num_workers=NUM_WORKERS)
+                # 📌 [핵심 수정] 시간 단축을 위한 고성능 데이터 로더 세팅 이식
+                l_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2, persistent_workers=True)
+                l_val = DataLoader(ds_val, batch_size=bs, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2, persistent_workers=True)
                 
                 model = get_model(model_name, DEVICE)
-                optimizer = optim.AdamW(model.parameters(), lr=lr)
-                criterion = nn.CrossEntropyLoss().to(DEVICE)
                 
-                # [수정] 최신 PyTorch 버전에 맞춘 GradScaler (Deprecation Warning 해결)
+                print(f"     ❄️ {model_name} Backbone Freezing 활성화...")
+                
+                for param in model.parameters():
+                    param.requires_grad = False
+                    
+                if model_name == "videomae" and hasattr(model, 'classifier'):
+                    for param in model.classifier.parameters(): param.requires_grad = True
+                elif hasattr(model, 'fc'):
+                    for param in model.fc.parameters(): param.requires_grad = True
+                elif hasattr(model, 'head'):
+                    for param in model.head.parameters(): param.requires_grad = True
+                elif hasattr(model, 'get_classifier'):
+                    for param in model.get_classifier().parameters(): param.requires_grad = True
+
+                optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+                weights = torch.tensor([1.0, 2.3]).cuda() # Real:Fake 비율 역순
+                criterion = nn.CrossEntropyLoss(weight=weights)
                 scaler = torch.amp.GradScaler('cuda')
                 
                 best_epoch_auc = 0.0
@@ -88,17 +103,15 @@ def run_grid_search_group(models, group_name):
                         x, y = x.to(DEVICE), y.to(DEVICE, dtype=torch.long)
                         optimizer.zero_grad()
                         
-                        # [수정] 최신 PyTorch 버전에 맞춘 autocast
                         with torch.amp.autocast('cuda'):
-                            # [핵심 수정] VideoMAE와 R3D의 텐서 구조(Shape) 차이 완벽 분기
                             if model_name == "videomae":
-                                out = model(x)  # VideoMAE는 (B, T, C, H, W) 그대로 사용
-                                if hasattr(out, 'logits'): # HuggingFace 객체 반환 시 로짓 추출
+                                out = model(pixel_values=x)  
+                                if hasattr(out, 'logits'): 
                                     out = out.logits
                             elif is_temp:
-                                out = model(x.permute(0, 2, 1, 3, 4)) # PyTorch 내장 R3D는 (B, C, T, H, W)로 변환
+                                out = model(x.permute(0, 2, 1, 3, 4))
                             else:
-                                out = model(x) # 공간적 모델
+                                out = model(x)
                                 
                             loss = criterion(out, y)
                             
@@ -106,23 +119,21 @@ def run_grid_search_group(models, group_name):
                         scaler.step(optimizer)
                         scaler.update()
 
-                    # 검증 (매 에포크마다 확인)
                     model.eval()
                     preds, trues = [], []
                     with torch.no_grad():
                         for vx, vy in l_val:
                             vx = vx.to(DEVICE)
-                            
-                            # [핵심 수정] 검증 시에도 동일하게 분기 적용
-                            if model_name == "videomae":
-                                vout = model(vx)
-                                if hasattr(vout, 'logits'):
-                                    vout = vout.logits
-                            elif is_temp:
-                                vout = model(vx.permute(0, 2, 1, 3, 4))
-                            else:
-                                vout = model(vx)
-                                
+                            with torch.amp.autocast('cuda'):
+                                if model_name == "videomae":
+                                    vout = model(pixel_values=vx)
+                                    if hasattr(vout, 'logits'): 
+                                        vout = vout.logits
+                                elif is_temp:
+                                    vout = model(vx.permute(0, 2, 1, 3, 4))
+                                else:
+                                    vout = model(vx)
+                                    
                             preds.extend(torch.softmax(vout, 1)[:, 1].cpu().tolist())
                             trues.extend(vy.tolist())
                     
@@ -131,15 +142,16 @@ def run_grid_search_group(models, group_name):
                     if epoch_auc > best_epoch_auc:
                         best_epoch_auc = epoch_auc
                 
-                print(f"    ✅ LR={lr} | Best AUC (over {TEST_EPOCHS} eps)={best_epoch_auc:.4f}")
+                print(f"    ✅ LR={lr} | Best AUC = {best_epoch_auc:.4f}")
                 group_results.append({"Model": model_name, "LR": lr, "AUC": best_epoch_auc})
                 
-                del model, optimizer, scaler
+                # 메모리 누수 방지용 명시적 객체 파괴
+                del model, optimizer, scaler, l_tr, l_val
                 torch.cuda.empty_cache()
                 gc.collect()
 
             except Exception as e:
-                print(f"    ❌ Error at LR={lr}: {e}")
+                print(f"    ❌ Error at LR={lr} for {model_name}: {e}")
                 torch.cuda.empty_cache()
                 gc.collect()
                 continue
@@ -165,10 +177,9 @@ if __name__ == "__main__":
         
         if os.path.exists(csv_file):
             existing_df = pd.read_csv(csv_file)
-            existing_df = existing_df[existing_df['Model'] != 'videomae']
             updated_df = pd.concat([existing_df, new_df], ignore_index=True)
             updated_df.to_csv(csv_file, index=False)
-            print(f"\n💾 성공: 기존 '{csv_file}' 파일에 VideoMAE 결과가 안전하게 이어 쓰기 되었습니다.")
+            print(f"\n💾 성공: '{csv_file}' 파일에 6개 모델 결과가 누적 저장되었습니다.")
         else:
             new_df.to_csv(csv_file, index=False)
             print(f"\n💾 새로운 '{csv_file}' 파일이 생성되어 저장되었습니다.")
