@@ -10,7 +10,7 @@ from tqdm import tqdm
 from sklearn.model_selection import StratifiedKFold
 
 # 📂 [경로 고정] 불균형 데이터셋 경로
-TRAIN_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\processed_cases\train\case4_mixed"
+TRAIN_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\split_datasets\dataset_A\train"   
 SEQUENCE_LENGTH = 16
 IMG_SIZE = 224
 
