@@ -4,139 +4,271 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 import torchvision.transforms.functional as TF
-import cv2, os, gc, random, argparse
+import cv2
+import os
+import gc
+import random
 import numpy as np
 from tqdm import tqdm
 from sklearn.model_selection import StratifiedKFold
+from pathlib import Path
 
-# 📂 [경로 고정] 불균형 데이터셋 경로
-TRAIN_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\split_datasets\dataset_A\train"   
-SEQUENCE_LENGTH = 16
-IMG_SIZE = 224
+# ======================================================
+# [설정] 7대 체크리스트 및 하이퍼파라미터
+# ======================================================
+# 1. 데이터 및 저장 경로
+BASE_DATA_DIR = Path(r"C:\Users\leejy\Desktop\test_experiment\dataset\final_dataset")
+SAVE_MODEL_DIR = Path(r"C:\Users\leejy\Desktop\test_experiment\models")
 
-# 🚀 [VRAM 안전선 최대 튜닝] 3D CNN은 VRAM을 많이 먹으므로 16~32 선에서 타협
-BATCH_SIZE = 16 
+# 2. 학습할 도메인 및 모델 순서
+TARGET_DOMAINS = ["raw", "youtube", "instagram", "kakao_high", "kakao_normal"]
+TARGET_MODELS = ["r3d", "r2plus1d"]  # 두 가지 Temporal 모델 모두 학습
 
-base_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.43216, 0.394666, 0.37645], std=[0.22803, 0.22145, 0.216989])
-])
+# 3. 하이퍼파라미터
+SEQUENCE_LENGTH = 16    # 3D CNN 입력 프레임 수
+IMG_SIZE = 112          # 이미지 크기 (메모리 절약: 112, 고성능: 224)
+BATCH_SIZE = 8          # VRAM에 따라 조절 (4~16 권장)
+EPOCHS = 10             # Fold당 에폭 수
+LEARNING_RATE = 1e-4
+SEED = 42
+PATIENCE = 5            # 조기 종료 조건
 
-def clean_memory(): gc.collect(); torch.cuda.empty_cache()
+# ======================================================
 
-class EarlyStopping:
-    def __init__(self, patience=6, path='checkpoint.pth'):
-        self.patience, self.counter, self.best_loss, self.early_stop, self.path = patience, 0, None, False, path
-    def __call__(self, val_loss, model):
-        if self.best_loss is None or val_loss < self.best_loss:
-            self.best_loss, self.counter = val_loss, 0
-            torch.save(model.state_dict(), self.path)
-        else:
-            self.counter += 1
-            if self.counter >= self.patience: self.early_stop = True
+def seed_everything(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+def clean_memory():
+    """🔥 VRAM 메모리 누수 방지를 위한 강력한 청소부"""
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def check_7_points(domain, model_name):
+    print(f"\n✅ [CHECK] {domain.upper()} - {model_name.upper()} 7대 점검 시작")
+    
+    # 1. Seed
+    seed_everything(SEED)
+    print(f"   1. Seed: {SEED} (Fixed)")
+    
+    # 2. Device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"   2. Device: {device}")
+    
+    # 3. Data Path
+    data_path = BASE_DATA_DIR / domain / "train"
+    if not data_path.exists():
+        raise FileNotFoundError(f"❌ 데이터 경로 없음: {data_path}")
+    print(f"   3. Data Path: {data_path}")
+    
+    # 4. Hparams
+    print(f"   4. Params: Batch={BATCH_SIZE}, LR={LEARNING_RATE}, Seq={SEQUENCE_LENGTH}")
+    
+    # 5. Save Path
+    save_dir = SAVE_MODEL_DIR / f"temporal_{domain}_{model_name}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    print(f"   5. Save Dir: {save_dir}")
+    
+    return device, data_path, save_dir
+
+# ======================================================
+# [Dataset] 영상 프레임 시퀀스 로더
+# ======================================================
 class VideoSequenceDataset(Dataset):
     def __init__(self, samples, transform=None, is_train=True):
-        self.samples, self.transform, self.is_train = samples, transform, is_train
-    def __len__(self): return len(self.samples)
+        self.samples = samples
+        self.transform = transform
+        self.is_train = is_train
+
+    def __len__(self):
+        return len(self.samples)
+
     def __getitem__(self, idx):
         video_path, label = self.samples[idx]
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(str(video_path))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # 16프레임 시퀀스 무작위 시작점 추출
-        start = random.randint(0, total - SEQUENCE_LENGTH) if total > SEQUENCE_LENGTH else 0
+        # 랜덤 시작점 (Train) vs 중앙 시작점 (Val)
+        if total > SEQUENCE_LENGTH:
+            if self.is_train:
+                start = random.randint(0, total - SEQUENCE_LENGTH)
+            else:
+                start = (total - SEQUENCE_LENGTH) // 2
+        else:
+            start = 0
+            
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-        frames, apply_hflip = [], (random.random() > 0.5) if self.is_train else False
+        
+        frames = []
+        # Train일 때만 좌우 반전 랜덤 적용
+        apply_hflip = (random.random() > 0.5) if self.is_train else False
         
         for _ in range(SEQUENCE_LENGTH):
             ret, frame = cap.read()
-            if not ret: frame = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
-            else: frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if not ret:
+                # 프레임 부족 시 검은 화면 패딩
+                frame = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+            else:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
             pil_img = transforms.ToPILImage()(frame)
             pil_img = transforms.Resize((IMG_SIZE, IMG_SIZE))(pil_img)
             
-            if apply_hflip: pil_img = TF.hflip(pil_img)
+            if apply_hflip:
+                pil_img = TF.hflip(pil_img)
             
-            # 📌 [약한 증강] 시간적 모델은 과도한 증강 시 프레임 연속성이 깨짐
             if self.is_train:
-                pil_img = transforms.ColorJitter(brightness=0.2, contrast=0.2)(pil_img)
+                # 약한 색상 증강
+                pil_img = transforms.ColorJitter(brightness=0.1, contrast=0.1)(pil_img)
                 
             frames.append(self.transform(pil_img))
+            
         cap.release()
+        
+        # (T, C, H, W) -> (C, T, H, W) : 3D CNN 입력 형태
         return torch.stack(frames).permute(1, 0, 2, 3), label
 
-def train_model(model_type, epochs=30):
+# ======================================================
+# [Training] 단일 도메인 & 단일 모델 학습 함수
+# ======================================================
+def train_one_session(domain, model_name):
+    # 1. 체크리스트 및 설정 로드
+    device, data_path, save_dir = check_7_points(domain, model_name)
     clean_memory()
+    
+    # 2. 데이터 로드 (Real/Fake)
     all_samples = []
     for sub, lab in [("real", 0), ("fake", 1)]:
-        d = os.path.join(TRAIN_DIR, sub)
-        if os.path.exists(d): all_samples += [(os.path.join(d, f), lab) for f in os.listdir(d) if f.endswith('.mp4')]
-    
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    
-    # ⚖️ [가중치 설정] Real(270) vs Fake(135) 불균형 해소 페널티
-    class_weights = torch.tensor([1.0, 2.0]).cuda()
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+        d = data_path / sub
+        if d.exists():
+            files = list(d.glob("*.mp4"))
+            all_samples += [(p, lab) for p in files]
+            
+    if not all_samples:
+        print(f"⚠️ {domain} 데이터가 비어있습니다. 건너뜁니다.")
+        return
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(all_samples, [s[1] for s in all_samples])):
-        print(f"\n🔄 [Training] Fold {fold+1}/5 Start - {model_type.upper()}")
+    print(f"   6. Data Count: Total {len(all_samples)} samples")
+
+    # 3. Transform (Kinetics-400 Norm)
+    base_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.43216, 0.394666, 0.37645], std=[0.22803, 0.22145, 0.216989])
+    ])
+
+    # 4. 5-Fold Stratified Cross Validation
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    labels_only = [s[1] for s in all_samples]
+    
+    print(f"   7. Fold: 5-Fold Stratified CV Ready")
+    print("="*50)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(all_samples, labels_only)):
+        print(f"\n🔄 [{domain.upper()}-{model_name.upper()}] Fold {fold+1}/5 Start")
         
-        # 🚀 [VRAM 풀가동 로더 튜닝] CPU 공급 가속
-        train_loader = DataLoader(
-            VideoSequenceDataset([all_samples[i] for i in train_idx], base_transform, True), 
-            batch_size=BATCH_SIZE, shuffle=True, num_workers=4, 
-            pin_memory=True, prefetch_factor=4, persistent_workers=True
-        )
-        val_loader = DataLoader(
-            VideoSequenceDataset([all_samples[i] for i in val_idx], base_transform, False), 
-            batch_size=BATCH_SIZE, shuffle=False, num_workers=4, 
-            pin_memory=True, prefetch_factor=4, persistent_workers=True
-        )
+        # Dataset & Loader
+        train_ds = VideoSequenceDataset([all_samples[i] for i in train_idx], base_transform, True)
+        val_ds = VideoSequenceDataset([all_samples[i] for i in val_idx], base_transform, False)
         
-        model = (models.video.r3d_18(weights='KINETICS400_V1') if model_type == "r3d" else models.video.r2plus1d_18(weights='KINETICS400_V1'))
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+        
+        # Model Selection
+        if model_name == "r3d":
+            model = models.video.r3d_18(weights='KINETICS400_V1')
+        else: # r2plus1d
+            model = models.video.r2plus1d_18(weights='KINETICS400_V1')
+            
+        # 이진 분류로 변경
         model.fc = nn.Linear(model.fc.in_features, 2)
-        model = model.cuda()
-
-        for param in model.parameters(): param.requires_grad = False
-        for param in model.layer4.parameters(): param.requires_grad = True
-        for param in model.fc.parameters(): param.requires_grad = True
-
-        if model_type == 'r3d': best_lr = 1e-04
-        elif model_type == 'r2plus1d': best_lr = 5e-05
-        else: best_lr = 1e-04
-
-        # 🚀 [가중치 감쇠 투여]
-        optimizer = optim.AdamW([
-            {'params': model.layer4.parameters(), 'lr': best_lr * 0.1},
-            {'params': model.fc.parameters(), 'lr': best_lr}
-        ], weight_decay=1e-2)
-
-        scaler, early_stopping = torch.amp.GradScaler('cuda'), EarlyStopping(patience=6, path=f"model_temporal_{model_type}_fold{fold+1}.pth")
-
-        for epoch in range(epochs):
+        model = model.to(device)
+        
+        # Loss & Optimizer
+        criterion = nn.CrossEntropyLoss() # 1:1 비율이므로 가중치 불필요
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-2)
+        scaler = torch.amp.GradScaler('cuda') # Mixed Precision
+        
+        best_acc = 0.0
+        patience = 0
+        
+        for epoch in range(EPOCHS):
             model.train()
             train_loss = 0.0
-            for inputs, labels in tqdm(train_loader, desc=f"Fold {fold+1} Ep {epoch+1}", leave=False):
-                inputs, labels = inputs.cuda(), labels.cuda()
+            
+            # Train Loop
+            pbar = tqdm(train_loader, desc=f"Ep {epoch+1}", leave=False)
+            for inputs, targets in pbar:
+                inputs, targets = inputs.to(device), targets.to(device)
+                
                 optimizer.zero_grad()
-                with torch.amp.autocast('cuda'): loss = criterion(model(inputs), labels)
-                scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+                with torch.amp.autocast('cuda'):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
                 train_loss += loss.item()
+                pbar.set_postfix({'loss': loss.item()})
             
-            model.eval(); val_loss = 0.0
+            # Validation Loop
+            model.eval()
+            correct = 0
+            total = 0
             with torch.no_grad():
-                for inputs, labels in val_loader:
-                    inputs, labels = inputs.cuda(), labels.cuda()
-                    with torch.amp.autocast('cuda'): val_loss += criterion(model(inputs), labels).item()
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(inputs)
+                    _, predicted = torch.max(outputs, 1)
+                    total += targets.size(0)
+                    correct += (predicted == targets).sum().item()
             
-            v_loss = val_loss / len(val_loader)
-            print(f"   - Ep {epoch+1}: Train {train_loss/len(train_loader):.4f} | Val {v_loss:.4f}")
-            early_stopping(v_loss, model)
-            if early_stopping.early_stop: 
-                print("   ⚠️ 조기 종료 발동")
-                break
-        del model; clean_memory()
+            val_acc = correct / total
+            avg_loss = train_loss / len(train_loader)
+            
+            print(f"   📅 Ep {epoch+1}: Loss {avg_loss:.4f} | Val Acc {val_acc:.4f}")
+            
+            # Checkpoint
+            if val_acc > best_acc:
+                best_acc = val_acc
+                patience = 0
+                torch.save(model.state_dict(), save_dir / f"best_fold{fold+1}.pth")
+                # print(f"      💾 Best Save (Acc: {best_acc:.4f})")
+            else:
+                patience += 1
+                if patience >= PATIENCE:
+                    print("      🛑 Early Stopping")
+                    break
+        
+        # Fold 종료 후 반드시 메모리 정리
+        del model, optimizer, train_loader, val_loader, scaler
+        clean_memory()
+        print(f"   🧹 Fold {fold+1} Finished & Memory Cleaned")
+
+# ======================================================
+# [Main] 마스터 루프
+# ======================================================
+def main():
+    print("🚀 [Master Train] Temporal Model 통합 학습 시작")
+    print(f"📋 Domains: {TARGET_DOMAINS}")
+    print(f"📋 Models: {TARGET_MODELS}")
+    
+    for domain in TARGET_DOMAINS:
+        for model_name in TARGET_MODELS:
+            try:
+                train_one_session(domain, model_name)
+                print(f"\n🎉 {domain.upper()} - {model_name.upper()} 완료!\n")
+            except Exception as e:
+                print(f"\n❌ ERROR in {domain}-{model_name}: {e}")
+                # 에러 나도 다음 도메인으로 계속 진행
+                continue
 
 if __name__ == "__main__":
-    for m in ["r3d", "r2plus1d"]: train_model(m)
+    main()
