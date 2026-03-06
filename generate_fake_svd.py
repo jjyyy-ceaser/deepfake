@@ -3,7 +3,7 @@ import os
 import cv2
 import numpy as np
 import gc
-import time
+# time 모듈 삭제 (휴식 없이 풀가동)
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.utils import export_to_video
 from tqdm import tqdm
@@ -19,36 +19,35 @@ MODEL_ID = "stabilityai/stable-video-diffusion-img2vid-xt"
 
 def prepare_image_for_svd(frame, target_size=(1024, 576)):
     """
-    [정석 해결법]
-    원본을 억지로 늘리지 않고, 16:9 비율 영역만 중앙에서 잘라낸 뒤 확대합니다.
-    인물의 얼굴 형태(기하학적 구조)가 100% 보존됩니다.
+    [비율 보정 유지]
+    속도는 올리되, 비율은 1:1로 정확하게 유지합니다.
     """
     h, w, _ = frame.shape
     target_w, target_h = target_size
     target_aspect = target_w / target_h
     
-    # 1. 현재 원본 너비(w)에 맞는 16:9 높이 계산
     new_h = int(w / target_aspect) 
-    
-    # 2. 상하 중앙 좌표 계산 (Center Crop)
     start_y = (h - new_h) // 2
     
-    # 3. 자르기 (이 과정에서 비율 왜곡이 사라짐)
-    if start_y < 0: # 혹시 원본이 너무 납작한 경우 대비
-        cropped_frame = frame 
+    if start_y < 0:
+        cropped_frame = frame
     else:
         cropped_frame = frame[start_y:start_y+new_h, :] 
 
-    # 4. SVD 입력 해상도로 리사이즈
     return cv2.resize(cropped_frame, (target_w, target_h))
 
-print(f"💎 SVD 정석 데이터 생성 (비율 보정 + ID 매칭)")
+print(f"💎 SVD 고속 생성 모드 (비율 보정 O, 속도 제한 해제)")
 os.makedirs(FAKE_VIDEO_DIR, exist_ok=True)
 
 try:
-    pipe = StableVideoDiffusionPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16, variant="fp16")
-    pipe.enable_model_cpu_offload()
-    pipe.enable_attention_slicing()
+    pipe = StableVideoDiffusionPipeline.from_pretrained(
+        MODEL_ID, 
+        torch_dtype=torch.float16, 
+        variant="fp16"
+    )
+    # CPU Offload는 유지해야 12GB에서 돌아갑니다
+    pipe.enable_model_cpu_offload() 
+    pipe.enable_attention_slicing() 
     print("✅ 모델 준비 완료")
 except Exception as e:
     print(f"❌ 오류: {e}"); exit()
@@ -60,7 +59,6 @@ processed_count = 0
 for video_name in real_videos:
     if processed_count >= TARGET_COUNT: break
 
-    # 파일명 매칭: 000.mp4 -> svd_000.mp4
     name_only = os.path.splitext(video_name)[0]
     save_name = f"svd_{name_only}.mp4"
     save_path = os.path.join(FAKE_VIDEO_DIR, save_name)
@@ -73,25 +71,37 @@ for video_name in real_videos:
         ret, frame = cap.read(); cap.release()
         if not ret: continue
 
-        # ⚡ 비율 보정 적용
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image_np = prepare_image_for_svd(frame) 
         image = Image.fromarray(image_np)
 
-        result = pipe(image, decode_chunk_size=2, num_inference_steps=25, generator=torch.manual_seed(42))
+        # ⚡ [속도 복구 핵심] decode_chunk_size를 8로 상향
+        # 아까 2였던 것을 8로 올려서 처리 속도를 대폭 높입니다.
+        generator = torch.manual_seed(42)
+        result = pipe(
+            image, 
+            decode_chunk_size=8, 
+            num_inference_steps=25, 
+            generator=generator
+        )
         export_to_video(result.frames[0], save_path, fps=7)
         
-        # 메모리 정리
-        del result; gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
-        time.sleep(1) # 발열 제어
+        # 메모리 정리 (속도를 위해 sleep 삭제)
+        del result, image, image_np
+        gc.collect()                 
+        torch.cuda.empty_cache()     
+        torch.cuda.synchronize()     
         
         processed_count += 1
         pbar.update(1)
         pbar.set_description(f"Done: {save_name}")
 
     except Exception as e:
-        print(f"❌ {save_name} 에러: {e}")
-        if "out of memory" in str(e).lower(): break
+        print(f"\n❌ {save_name} 에러: {e}")
+        # 혹시 속도 높이다가 메모리 부족 뜨면 그때만 알려줌
+        if "out of memory" in str(e).lower():
+            print("🚨 VRAM 부족 발생. (속도가 너무 빨라 메모리가 찼습니다)")
+            break
         continue
 
 pbar.close()
