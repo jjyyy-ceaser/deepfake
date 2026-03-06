@@ -1,187 +1,145 @@
+import os
+import multiprocessing
+import itertools
+import pandas as pd
+import gc
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import GroupKFold
 from sklearn.metrics import roc_auc_score
-import os, glob, sys, gc
-import pandas as pd
-from tqdm import tqdm
-from utils import DeepfakeDataset, get_model
-from torchvision import transforms
+from tqdm import tqdm  # 실시간 진행 상황 확인을 위한 라이브러리
 
-# ==========================================
-# ⚙️ Final Grid Search 설정 (6개 모델 전체 탐색 + 초고속 로딩)
-# ==========================================
-BASE_DIR = "C:/Users/leejy/Desktop/test_experiment/dataset/final_datasets"
-TARGET_DATASET = "dataset_A_pure"  # 📌 학습과 동일한 Dataset A 고정
+def get_optimizer(model, model_name, lr, weight_decay, layer_decay=1.0):
+    if "videomae" in model_name and layer_decay < 1.0:
+        # VideoMAE의 Layer-wise Learning Rate Decay 적용
+        params = [{'params': p, 'lr': lr * layer_decay if "videomae" in n else lr} for n, p in model.named_parameters()]
+        return optim.AdamW(params, weight_decay=weight_decay)
+    return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-LR_LIST = [1e-5, 5e-6, 1e-6]       # 📌 극소 학습률 적용
-NUM_WORKERS = 8                    # 📌 CPU 코어 풀가동 설정
-DEVICE = torch.device("cuda")
-TEST_EPOCHS = 5 
-
-SPATIAL_MODELS = ["xception", "convnext", "swin"]
-TEMPORAL_MODELS = ["r3d", "r2plus1d", "videomae"]
-
-def get_group_config(group_name):
-    if group_name == 'TEMPORAL':
-        tf = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.43216, 0.394666, 0.37645], std=[0.22803, 0.22145, 0.216989])
-        ])
-        return tf, 16
-    else:
-        tf = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        return tf, 32
-
-def run_grid_search_group(models, group_name):
-    if not models:
-        return []
-
-    print(f"\n🚀 Starting Grid Search Group: {group_name} (Epochs: {TEST_EPOCHS})")
-    tf, bs = get_group_config(group_name)
+def main():
+    multiprocessing.freeze_support()
+    # 윈도우 환경에서 OpenCV와의 충돌 방지 및 경로 설정
+    os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
     
-    base = os.path.join(BASE_DIR, TARGET_DATASET)
-    real = glob.glob(os.path.join(base, "real", "*"))
-    fake = glob.glob(os.path.join(base, "fake", "*"))
-    
-    if len(real) == 0 or len(fake) == 0:
-        print(f"❌ Error: 데이터를 찾을 수 없습니다. {base}")
-        return []
+    from utils import get_model
+    from data_loader import get_dataloader, prepare_dataset 
 
-    files, labels = real + fake, [0]*len(real) + [1]*len(fake)
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    t_idx, v_idx = next(skf.split(files, labels)) 
+    # [중요] 새로 구축한 CelebV-HQ + AniPortrait 데이터셋 경로
+    BASE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\processed_cases\train\case1_original"
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # [Rev.10] 정밀 사양서 기반 Grid Search Space 설정
+    GRID_CONFIGS = {
+        "xception": {
+            "fixed": {"bs": 64}, 
+            "search": {"lr": [1e-3, 5e-4, 1e-4], "dropout": [0.2, 0.35, 0.5]}
+        },
+        "swin": {
+            "fixed": {"bs": 64}, 
+            "search": {"lr": [1e-4, 5e-5, 1e-5], "weight_decay": [0.01, 0.03, 0.05]}
+        },
+        "r3d": {
+            "fixed": {"bs": 16}, 
+            "search": {"lr": [1e-3, 5e-4, 1e-4], "sampling": ["uniform", "dense"]}
+        },
+        "videomae": {
+            "fixed": {"bs": 4, "accum": 4}, 
+            "search": {"lr": [5e-4, 1e-4], "layer_decay": [0.65, 0.7, 0.75]}
+        },
+        "hybrid": {
+            "fixed": {"bs": 32}, 
+            "search": {"lr": [1e-3, 5e-4, 1e-4], "dropout": [0.3, 0.4, 0.5]}
+        }
+    }
+
+    print(f"🚀 데이터 로드 중: {BASE_DIR}")
+    files, labels, groups = prepare_dataset(BASE_DIR)
+    gkf = GroupKFold(n_splits=5)
     
-    group_results = []
+    # 예비 탐색을 위한 Fold 0 인덱스 추출
+    fold0_idx, fold0_val_idx = next(gkf.split(files, labels, groups=groups))
     
-    for model_name in models:
-        print(f"  🔹 Model: {model_name} (Batch: {bs})")
-        is_temp = group_name == 'TEMPORAL'
+    pre_results = []
+
+    for model_name, cfg in GRID_CONFIGS.items():
+        keys, values = zip(*cfg["search"].items())
+        combos = [dict(zip(keys, v)) for v in itertools.product(*values)]
         
-        ds_tr = DeepfakeDataset([files[i] for i in t_idx], [labels[i] for i in t_idx], 'temporal' if is_temp else 'spatial', tf)
-        ds_val = DeepfakeDataset([files[i] for i in v_idx], [labels[i] for i in v_idx], 'temporal' if is_temp else 'spatial', tf)
+        print(f"\n{'='*30} 🤖 {model_name.upper()} Preliminary Search {'='*30}")
         
-        for lr in LR_LIST:
-            try:
-                # 📌 [핵심 수정] 시간 단축을 위한 고성능 데이터 로더 세팅 이식
-                l_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2, persistent_workers=True)
-                l_val = DataLoader(ds_val, batch_size=bs, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2, persistent_workers=True)
+        for i, params in enumerate(combos):
+            print(f"\n▶ Combo [{i+1}/{len(combos)}]: {params}")
+            
+            tr_f, tr_l = [files[k] for k in fold0_idx], [labels[k] for k in fold0_idx]
+            val_f, val_l = [files[k] for k in fold0_val_idx], [labels[k] for k in fold0_val_idx]
+            
+            samp = params.get("sampling", "uniform")
+            loader_tr = get_dataloader(tr_f, tr_l, model_name, cfg["fixed"]["bs"], sampling=samp)
+            loader_val = get_dataloader(val_f, val_l, model_name, cfg["fixed"]["bs"], sampling=samp, shuffle=False)
+            
+            model = get_model(model_name, DEVICE, dropout_rate=params.get("dropout", 0.0))
+            opt = get_optimizer(model, model_name, params["lr"], params.get("weight_decay", 0.01), params.get("layer_decay", 1.0))
+            criterion = nn.CrossEntropyLoss()
+            scaler = torch.amp.GradScaler('cuda')
+            accum_steps = cfg["fixed"].get("accum", 1)
+
+            # 3 Epoch 짧은 예비 학습 시작
+            for epoch in range(3):
+                model.train()
+                pbar = tqdm(enumerate(loader_tr), total=len(loader_tr), 
+                            desc=f"   Epoch {epoch+1}/3", unit="batch", leave=False)
                 
-                model = get_model(model_name, DEVICE)
-                
-                print(f"     ❄️ {model_name} Backbone Freezing 활성화...")
-                
-                for param in model.parameters():
-                    param.requires_grad = False
+                for step, (bx, by) in pbar:
+                    bx, by = bx.to(DEVICE), by.to(DEVICE)
                     
-                if model_name == "videomae" and hasattr(model, 'classifier'):
-                    for param in model.classifier.parameters(): param.requires_grad = True
-                elif hasattr(model, 'fc'):
-                    for param in model.fc.parameters(): param.requires_grad = True
-                elif hasattr(model, 'head'):
-                    for param in model.head.parameters(): param.requires_grad = True
-                elif hasattr(model, 'get_classifier'):
-                    for param in model.get_classifier().parameters(): param.requires_grad = True
+                    # R3D 모델만 차원 순서를 (B, C, T, H, W)로 변환
+                    if "r3d" in model_name: 
+                        bx = bx.permute(0, 2, 1, 3, 4)
+                    
+                    with torch.amp.autocast('cuda'):
+                        out = model(pixel_values=bx).logits if "videomae" in model_name else model(bx)
+                        loss = criterion(out, by) / accum_steps
+                    
+                    scaler.scale(loss).backward()
+                    
+                    if (step + 1) % accum_steps == 0:
+                        scaler.step(opt); scaler.update(); opt.zero_grad()
+                    
+                    # 진행 바에 현재 Loss 표시
+                    if step % 5 == 0:
+                        pbar.set_postfix(loss=f"{loss.item()*accum_steps:.4f}")
 
-                optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
-                weights = torch.tensor([1.0, 2.3]).cuda() # Real:Fake 비율 역순
-                criterion = nn.CrossEntropyLoss(weight=weights)
-                scaler = torch.amp.GradScaler('cuda')
-                
-                best_epoch_auc = 0.0
-                
-                for ep in range(TEST_EPOCHS):
-                    model.train()
-                    for x, y in tqdm(l_tr, desc=f"    LR={lr} | Ep={ep+1}", leave=False, ncols=80):
-                        x, y = x.to(DEVICE), y.to(DEVICE, dtype=torch.long)
-                        optimizer.zero_grad()
+                torch.cuda.empty_cache()
+
+            # 검증 단계
+            model.eval(); preds, trues = [], []
+            val_pbar = tqdm(loader_val, desc="   🔍 Evaluating", unit="batch", leave=False)
+            
+            with torch.no_grad():
+                for bx, by in val_pbar:
+                    bx = bx.to(DEVICE)
+                    if "r3d" in model_name: 
+                        bx = bx.permute(0, 2, 1, 3, 4)
                         
-                        with torch.amp.autocast('cuda'):
-                            if model_name == "videomae":
-                                out = model(pixel_values=x)  
-                                if hasattr(out, 'logits'): 
-                                    out = out.logits
-                            elif is_temp:
-                                out = model(x.permute(0, 2, 1, 3, 4))
-                            else:
-                                out = model(x)
-                                
-                            loss = criterion(out, y)
-                            
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
-
-                    model.eval()
-                    preds, trues = [], []
-                    with torch.no_grad():
-                        for vx, vy in l_val:
-                            vx = vx.to(DEVICE)
-                            with torch.amp.autocast('cuda'):
-                                if model_name == "videomae":
-                                    vout = model(pixel_values=vx)
-                                    if hasattr(vout, 'logits'): 
-                                        vout = vout.logits
-                                elif is_temp:
-                                    vout = model(vx.permute(0, 2, 1, 3, 4))
-                                else:
-                                    vout = model(vx)
-                                    
-                            preds.extend(torch.softmax(vout, 1)[:, 1].cpu().tolist())
-                            trues.extend(vy.tolist())
+                    with torch.amp.autocast('cuda'):
+                        out = model(pixel_values=bx).logits if "videomae" in model_name else model(bx)
                     
-                    epoch_auc = roc_auc_score(trues, preds) if len(set(trues)) > 1 else 0.5
-                    
-                    if epoch_auc > best_epoch_auc:
-                        best_epoch_auc = epoch_auc
-                
-                print(f"    ✅ LR={lr} | Best AUC = {best_epoch_auc:.4f}")
-                group_results.append({"Model": model_name, "LR": lr, "AUC": best_epoch_auc})
-                
-                # 메모리 누수 방지용 명시적 객체 파괴
-                del model, optimizer, scaler, l_tr, l_val
-                torch.cuda.empty_cache()
-                gc.collect()
+                    preds.extend(torch.softmax(out, 1)[:, 1].cpu().tolist())
+                    trues.extend(by.tolist())
+                    del bx, out
+            
+            auc = roc_auc_score(trues, preds) if len(set(trues)) > 1 else 0.5
+            print(f"   📊 Combo {i+1} Fold 0 AUC: {auc:.4f}")
+            
+            pre_results.append({**params, "model": model_name, "fold0_auc": auc})
+            pd.DataFrame(pre_results).to_csv("preliminary_results.csv", index=False)
+            
+            # 메모리 해제 및 캐시 정리
+            del model, opt, loader_tr, loader_val, criterion, scaler
+            gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
 
-            except Exception as e:
-                print(f"    ❌ Error at LR={lr} for {model_name}: {e}")
-                torch.cuda.empty_cache()
-                gc.collect()
-                continue
-                
-    return group_results
+    print(f"\n{'='*30} 🏆 Preliminary Search 완료! {'='*30}")
 
 if __name__ == "__main__":
-    import torch.multiprocessing as mp
-    try: mp.set_start_method('spawn', force=True)
-    except: pass
-    
-    final_res = []
-    final_res.extend(run_grid_search_group(SPATIAL_MODELS, "SPATIAL"))
-    
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    final_res.extend(run_grid_search_group(TEMPORAL_MODELS, "TEMPORAL"))
-    
-    if final_res:
-        csv_file = "grid_search_master_results.csv"
-        new_df = pd.DataFrame(final_res)
-        
-        if os.path.exists(csv_file):
-            existing_df = pd.read_csv(csv_file)
-            updated_df = pd.concat([existing_df, new_df], ignore_index=True)
-            updated_df.to_csv(csv_file, index=False)
-            print(f"\n💾 성공: '{csv_file}' 파일에 6개 모델 결과가 누적 저장되었습니다.")
-        else:
-            new_df.to_csv(csv_file, index=False)
-            print(f"\n💾 새로운 '{csv_file}' 파일이 생성되어 저장되었습니다.")
-    else:
-        print("\n⚠️ 기록할 결과가 없습니다.")
+    main()

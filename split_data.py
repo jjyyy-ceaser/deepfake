@@ -1,100 +1,59 @@
 import os
 import shutil
-import random
-from collections import defaultdict
-from pathlib import Path
+from tqdm import tqdm
 
-# ======================================================
-# [설정] 경로 수정 (여기가 핵심입니다!)
-# ======================================================
-# 1. 스크린샷에 있는 '정상 데이터' 경로로 변경
-REAL_DIR = Path(r"D:\data\dataset\real")
-FAKE_DIR = Path(r"D:\data\dataset\fake")
+# ==========================================
+# ⚙️ 경로 설정
+# ==========================================
+SRC_DIR = r"D:\data\35666"
+DST_REAL_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\real"
+DST_FAKE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\fake"
 
-# 2. 최종 저장될 C드라이브 경로
-BASE_OUTPUT = Path(r"C:\Users\leejy\Desktop\test_experiment\dataset\final_dataset\raw")
+# 목표 개수 (아까 300개라고 하셨으니 300으로 설정)
+TARGET_COUNT = 300
 
-random.seed(42) # 실험 재현성 고정
-# ======================================================
-
-def create_folders():
-    # 기존 폴더가 있다면 안전하게 삭제 후 재생성 (찌꺼기 제거)
-    if BASE_OUTPUT.exists():
-        try:
-            shutil.rmtree(BASE_OUTPUT)
-            print(f"🧹 기존 폴더 정리 완료: {BASE_OUTPUT}")
-        except:
-            pass
-
-    paths = [
-        BASE_OUTPUT / "train" / "real",
-        BASE_OUTPUT / "train" / "fake",
-        BASE_OUTPUT / "test" / "real",
-        BASE_OUTPUT / "test" / "fake"
-    ]
-    for p in paths:
-        p.mkdir(parents=True, exist_ok=True)
-    print("📂 폴더 구조 생성 완료")
-
-def main():
-    create_folders()
-
-    # 1. Fake 폴더 파일 리스트업
-    fake_files = [f for f in os.listdir(FAKE_DIR) if f.endswith(".mp4")]
+def organize_dataset():
+    print(f"🚀 데이터셋 정제 시작...")
     
-    # 2. ID별 그룹화 (단순 매칭 로직 유지)
-    id_map = defaultdict(list)
-    for f in fake_files:
-        try:
-            # 유튜브 ID 추출: 01160--GLiEItdhO5A_1--Ani... -> GLiEItdhO5A
-            yt_id = f.split("--")[1].rsplit("_", 1)[0]
-            id_map[yt_id].append(f)
-        except:
-            continue
+    # 폴더 생성
+    os.makedirs(DST_REAL_DIR, exist_ok=True)
+    os.makedirs(DST_FAKE_DIR, exist_ok=True)
 
-    unique_ids = list(id_map.keys())
-    random.shuffle(unique_ids)
+    # 모든 mp4 파일 목록 가져오기
+    all_files = [f for f in os.listdir(SRC_DIR) if f.lower().endswith('.mp4')]
+    
+    used_ids = set()
+    count = 0
 
-    # 3. 8:2 비율 분할
-    split_idx = int(len(unique_ids) * 0.8)
-    train_ids = unique_ids[:split_idx]
-    test_ids = unique_ids[split_idx:]
+    print(f"🔍 중복 ID 제거 및 복사 중 (목표: {TARGET_COUNT}개)...")
+    
+    for filename in tqdm(all_files):
+        # 💡 [중요] ID 추출 로직
+        # CelebV-HQ 파일명이 'ID_VideoName.mp4' 형태라면 첫 번째 언더바(_) 기준 앞부분이 ID입니다.
+        # 만약 파일명 형식이 다르다면 이 부분을 수정해야 합니다.
+        identity_id = filename.split('_')[0]
 
-    print(f"📊 총 인물(ID) 수: {len(unique_ids)}개")
-    print(f"📈 Train ID: {len(train_ids)}개 | Test ID: {len(test_ids)}개")
-    print("-" * 50)
+        # 이미 뽑은 인물이 아니라면 복사 진행
+        if identity_id not in used_ids:
+            src_path = os.path.join(SRC_DIR, filename)
+            
+            # 000.mp4, 001.mp4... 형식으로 저장 (3자리 숫자)
+            new_name = f"{count:03d}.mp4"
+            dst_path = os.path.join(DST_REAL_DIR, new_name)
 
-    def process_split(target_ids, split_name):
-        count = 0
-        missing = 0
-        for yt_id in target_ids:
-            for fake_name in id_map[yt_id]:
-                # 📌 [핵심 로직] 재영님의 코드 그대로 사용 (단순 접두어 추가)
-                real_name = f"real_{fake_name}"
-                
-                src_fake = FAKE_DIR / fake_name
-                src_real = REAL_DIR / real_name
-                
-                # 파일 존재 확인 (D드라이브 dataset\real에 있는지)
-                if src_fake.exists() and src_real.exists():
-                    shutil.copy2(src_fake, BASE_OUTPUT / split_name / "fake" / fake_name)
-                    shutil.copy2(src_real, BASE_OUTPUT / split_name / "real" / real_name)
-                    count += 1
-                else:
-                    # 혹시라도 파일이 없으면 로그 출력
-                    # print(f"⚠️ 파일 없음: {real_name}")
-                    missing += 1
-        return count, missing
+            shutil.copy2(src_path, dst_path)
+            
+            used_ids.add(identity_id)
+            count += 1
 
-    print("📦 파일 복사 시작...")
-    train_success, train_miss = process_split(train_ids, "train")
-    test_success, test_miss = process_split(test_ids, "test")
+        # 목표치 도달 시 종료
+        if count >= TARGET_COUNT:
+            break
 
-    print("=" * 50)
-    print(f"✅ [Train] 성공: {train_success}쌍 (실패: {train_miss})")
-    print(f"✅ [Test]  성공: {test_success}쌍 (실패: {test_miss})")
-    print(f"👉 총 합계: {train_success + test_success}쌍")
-    print(f"🚀 저장 경로: {BASE_OUTPUT}")
+    print(f"\n✅ 작업 완료!")
+    print(f"📊 저장된 Real 영상 수: {count}개")
+    print(f"📂 저장 경로: {DST_REAL_DIR}")
+    print(f"📁 Fake 저장 폴더 준비됨: {DST_FAKE_DIR}")
 
 if __name__ == "__main__":
-    main()
+    organize_dataset()

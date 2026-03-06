@@ -2,107 +2,74 @@ import torch
 import os
 import cv2
 import numpy as np
+import gc
+import time
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.utils import export_to_video
 from tqdm import tqdm
+from PIL import Image
 
 # ==========================================
-# ⚙️ 설정 (고화질 유지)
+# ⚙️ 경로 및 설정
 # ==========================================
-BASE_DIR = "C:/Users/leejy/Desktop/test_experiment/dataset"
-REAL_VIDEO_DIR = os.path.join(BASE_DIR, "0_main_train", "real")
-FAKE_VIDEO_DIR = os.path.join(BASE_DIR, "0_main_train", "fake")
+REAL_VIDEO_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\real"
+FAKE_VIDEO_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\fake"
 TARGET_COUNT = 300
-
-# ✅ 화질 타협 없음! (XT 모델 사용)
 MODEL_ID = "stabilityai/stable-video-diffusion-img2vid-xt"
 
-print(f"💎 SVD 고화질 모드 (메모리 최적화 적용)")
+def prepare_image_for_svd(frame, target_size=(1024, 576)):
+    """
+    512x512 원본에서 16:9 비율(512x288)을 중앙 크롭하여 왜곡 방지
+    """
+    h, w, _ = frame.shape
+    target_w, target_h = target_size
+    target_aspect = target_w / target_h
+    
+    # 1:1 -> 16:9로 만들기 위해 상하를 자름
+    new_h = int(w / target_aspect) # 512 / 1.77 = 288
+    start_y = (h - new_h) // 2
+    cropped = frame[start_y:start_y+new_h, :] 
+    
+    return cv2.resize(cropped, (target_w, target_h))
+
+print(f"💎 SVD 비율 보정 + 메모리 관리 모드 실행")
 os.makedirs(FAKE_VIDEO_DIR, exist_ok=True)
 
 try:
-    pipe = StableVideoDiffusionPipeline.from_pretrained(
-        MODEL_ID, 
-        torch_dtype=torch.float16, 
-        variant="fp16"
-    )
-    
-    # 🚨 [핵심 수정] 강제 GPU 할당(pipe.to("cuda"))을 뺍니다!
-    # 대신 라이브러리가 알아서 메모리를 관리하게 맡깁니다.
-    # 이렇게 하면 VRAM이 부족해도 느려지지 않고 효율적으로 돌아갑니다.
+    pipe = StableVideoDiffusionPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16, variant="fp16")
     pipe.enable_model_cpu_offload()
-    
-    # 추가 메모리 최적화 (화질 영향 없음)
     pipe.enable_attention_slicing()
-    
-    print("✅ 모델 로딩 완료! (CPU Offload + Slicing)")
-
 except Exception as e:
-    print(f"❌ 오류: {e}")
-    exit()
+    print(f"❌ 로딩 실패: {e}"); exit()
 
-# ==========================================
-# 🎬 생성 루프
-# ==========================================
 real_videos = sorted([f for f in os.listdir(REAL_VIDEO_DIR) if f.endswith('.mp4')])
-existing_fakes = [f for f in os.listdir(FAKE_VIDEO_DIR) if f.endswith('.mp4')]
-current_count = len(existing_fakes)
-
-print(f"📊 현재 {current_count}개 완료. {TARGET_COUNT}개까지 진행합니다.")
-pbar = tqdm(total=TARGET_COUNT, initial=current_count)
-
+pbar = tqdm(total=TARGET_COUNT)
 count = 0
+
 for video_name in real_videos:
-    if count >= TARGET_COUNT:
-        break
-
-    file_idx = count + 1
-    save_filename = f"fake_svd_{file_idx:03d}.mp4"
-    save_path = os.path.join(FAKE_VIDEO_DIR, save_filename)
-
-    # 이미 있으면 패스
+    if count >= TARGET_COUNT: break
+    save_path = os.path.join(FAKE_VIDEO_DIR, f"svd_{os.path.splitext(video_name)[0]}.mp4")
+    
     if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
-        count += 1
-        continue
+        count += 1; pbar.update(1); continue
 
     try:
-        video_path = os.path.join(REAL_VIDEO_DIR, video_name)
-        cap = cv2.VideoCapture(video_path)
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret:
-            count += 1
-            continue
+        cap = cv2.VideoCapture(os.path.join(REAL_VIDEO_DIR, video_name))
+        ret, frame = cap.read(); cap.release()
+        if not ret: continue
 
+        # ⚡ 비율 보정 핵심 로직 적용
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # 화질 유지를 위해 해상도 유지 (1024x576)
-        image = cv2.resize(frame, (1024, 576))
-        from PIL import Image
-        image = Image.fromarray(image)
+        image = Image.fromarray(prepare_image_for_svd(frame))
 
-        # 생성 (Inference)
-        # decode_chunk_size=2: 마지막에 비디오 합칠 때 VRAM 터지는 것 방지
-        frames = pipe(
-            image, 
-            decode_chunk_size=2, 
-            num_inference_steps=25, # 화질을 위해 25스텝 유지
-            generator=torch.manual_seed(42)
-        ).frames[0]
-
-        export_to_video(frames, save_path, fps=7)
+        result = pipe(image, decode_chunk_size=2, num_inference_steps=25, generator=torch.manual_seed(42))
+        export_to_video(result.frames[0], save_path, fps=7)
         
-        pbar.update(1)
-        pbar.set_description(f"Making {save_filename}")
-
+        # ⚡ 메모리 청소
+        del result; gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+        time.sleep(1)
+        count += 1; pbar.update(1)
     except Exception as e:
-        print(f"\n❌ 에러: {e}")
-        # VRAM 부족 메시지가 뜨면 알려줌
-        if "out of memory" in str(e).lower():
-            print("🚨 다른 프로그램(유튜브, 크롬 등)을 끄고 다시 시도해보세요.")
-        break
-    
-    count += 1
+        print(f" 에러: {e}"); continue
 
 pbar.close()
-print("\n🎉 완료!")

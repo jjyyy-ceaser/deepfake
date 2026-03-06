@@ -1,0 +1,9 @@
+🚀 [Final Check] Deepfake Cross-Domain Evaluation Started: 20260305_002806
+📌 Config: Batch=16, Device=cuda
+
+=======================================================
+🏋️ Train Domain: [RAW] Evaluation Start
+=======================================================
+
+  [Model: xception] (Category: Spatial)
+  ✅ Loaded 5 Folds (Ensemble Ready)
