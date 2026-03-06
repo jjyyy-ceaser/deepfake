@@ -7,9 +7,12 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from decord import VideoReader, cpu
 
-# [Rev.13] 최종 통합 로더 (검은 화면 방지 + ID 매칭 보정)
+try:
+    from decord import VideoReader, cpu
+except ImportError:
+    raise ImportError("pip install decord")
+
 MODEL_SPECS = {
     "r3d": {"size": (112, 112), "mean": [0.432, 0.394, 0.376], "std": [0.228, 0.221, 0.216], "frames": 16},
     "default": {"size": (224, 224), "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225], "frames": 16}
@@ -42,6 +45,7 @@ class DeepfakeDataset(Dataset):
         self.model_name = model_name.lower()
         self.sampling = sampling
         self.spec = MODEL_SPECS["r3d"] if "r3d" in self.model_name else MODEL_SPECS["default"]
+        
         self.transform = transforms.Compose([
             transforms.Resize(self.spec['size']),
             transforms.ToTensor(),
@@ -54,24 +58,29 @@ class DeepfakeDataset(Dataset):
         try:
             vr = VideoReader(path, ctx=cpu(0))
             total = len(vr)
-            num_req = self.spec['frames']
+            if total <= 0: return None
             
-            # ⚡ [검은 화면 방지] 영상이 16프레임보다 짧으면 마지막 프레임 반복(Padding)
+            num_req = self.spec['frames']
+            # ⚡ [검은 화면 방지] 짧은 영상 패딩
             if total < num_req:
                 indices = list(range(total)) + [total - 1] * (num_req - total)
             else:
-                indices = np.linspace(0, total - 1, num_req, dtype=int).tolist()
-            
+                if self.sampling == 'dense':
+                    start = max(0, (total - num_req * 2) // 2)
+                    indices = [min(int(start + i*2), total - 1) for i in range(num_req)]
+                else:
+                    indices = np.linspace(0, total - 1, num_req, dtype=int).tolist()
             return vr.get_batch(indices).asnumpy()
         except: return None
 
     def __getitem__(self, idx):
         path, label = self.file_paths[idx], self.labels[idx]
         frames = self._read_frames_decord(path)
+        
         if frames is None:
             sz = self.spec['size']
-            return (torch.zeros(3, *sz) if any(m in self.model_name for m in ["xception", "swin"]) 
-                    else torch.zeros(self.spec['frames'], 3, *sz)), label
+            if any(m in self.model_name for m in ["xception", "swin"]): return torch.zeros(3, *sz), label
+            else: return torch.zeros(self.spec['frames'], 3, *sz), label
 
         ref_idx = len(frames)//2 if any(m in self.model_name for m in ["xception", "swin"]) else 0
         x1, y1, x2, y2 = get_face_centric_crop(cv2.cvtColor(frames[ref_idx], cv2.COLOR_RGB2BGR))
@@ -83,18 +92,27 @@ class DeepfakeDataset(Dataset):
         processed = [self.transform(Image.fromarray(f[y1:y2, x1:x2])) for f in frames]
         return torch.stack(processed), label
 
+def get_dataloader(files, labels, model_name, batch_size, sampling='uniform', shuffle=True):
+    dataset = DeepfakeDataset(files, labels, model_name, sampling)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=4, pin_memory=True)
+
 def prepare_dataset(base_dir):
     real_paths = glob.glob(os.path.join(base_dir, "real", "*.mp4"))
+    if not real_paths: real_paths = glob.glob(os.path.join(base_dir, "real", "**", "*.mp4"), recursive=True)
+    
     fake_paths = glob.glob(os.path.join(base_dir, "fake", "*.mp4"))
+    if not fake_paths: fake_paths = glob.glob(os.path.join(base_dir, "fake", "**", "*.mp4"), recursive=True)
     
     all_data = []
     for p in real_paths:
-        # '000.mp4' -> ID: '000'
         all_data.append({'path': p, 'label': 0, 'id': os.path.basename(p).split('.')[0]})
-    for p in fake_paths:
-        # 'svd_000.mp4' -> ID: '000' (매칭 성공!)
-        fid = os.path.basename(p).replace('svd_', '').split('.')[0]
-        all_data.append({'path': p, 'label': 1, 'id': fid})
         
+    for p in fake_paths:
+        # ⚡ [ID 매칭] svd_000.mp4 -> ID: 000
+        fid = os.path.basename(p).replace('svd_', '').split('.')[0]
+        # 기존 호환성
+        fid = fid.replace('fake_svd_', '').split('--')[0]
+        all_data.append({'path': p, 'label': 1, 'id': fid})
+
     random.shuffle(all_data)
     return [d['path'] for d in all_data], [d['label'] for d in all_data], [d['id'] for d in all_data]
