@@ -7,29 +7,29 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import GroupKFold
-from sklearn.metrics import roc_auc_score
-from tqdm import tqdm  # 실시간 진행 상황 확인을 위한 라이브러리
+# -----------------------------------------------------------------------------
+# 📊 [핵심 수정] 5대 평가지표 모두 import
+# -----------------------------------------------------------------------------
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
+from tqdm import tqdm
 
 def get_optimizer(model, model_name, lr, weight_decay, layer_decay=1.0):
     if "videomae" in model_name and layer_decay < 1.0:
-        # VideoMAE의 Layer-wise Learning Rate Decay 적용
         params = [{'params': p, 'lr': lr * layer_decay if "videomae" in n else lr} for n, p in model.named_parameters()]
         return optim.AdamW(params, weight_decay=weight_decay)
     return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 def main():
     multiprocessing.freeze_support()
-    # 윈도우 환경에서 OpenCV와의 충돌 방지 및 경로 설정
     os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
     
     from utils import get_model
     from data_loader import get_dataloader, prepare_dataset 
 
-    
+    # ✅ 경로가 맞는지 마지막으로 확인하세요! (split_data.py 결과 경로)
     BASE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\final_dataset_v2\train"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # [Rev.10] 정밀 사양서 기반 Grid Search Space 설정
     GRID_CONFIGS = {
         "xception": {
             "fixed": {"bs": 64}, 
@@ -54,10 +54,12 @@ def main():
     }
 
     print(f"🚀 데이터 로드 중: {BASE_DIR}")
+    # -------------------------------------------------------------------------
+    # ⚠️ 만약 여기서 FileNotFoundError가 뜨면 BASE_DIR 경로를 다시 확인해주세요.
+    # -------------------------------------------------------------------------
     files, labels, groups = prepare_dataset(BASE_DIR)
     gkf = GroupKFold(n_splits=5)
     
-    # 예비 탐색을 위한 Fold 0 인덱스 추출
     fold0_idx, fold0_val_idx = next(gkf.split(files, labels, groups=groups))
     
     pre_results = []
@@ -84,7 +86,7 @@ def main():
             scaler = torch.amp.GradScaler('cuda')
             accum_steps = cfg["fixed"].get("accum", 1)
 
-            # 3 Epoch 짧은 예비 학습 시작
+            # 3 Epoch 예비 학습
             for epoch in range(3):
                 model.train()
                 pbar = tqdm(enumerate(loader_tr), total=len(loader_tr), 
@@ -92,8 +94,6 @@ def main():
                 
                 for step, (bx, by) in pbar:
                     bx, by = bx.to(DEVICE), by.to(DEVICE)
-                    
-                    # R3D 모델만 차원 순서를 (B, C, T, H, W)로 변환
                     if "r3d" in model_name: 
                         bx = bx.permute(0, 2, 1, 3, 4)
                     
@@ -106,14 +106,17 @@ def main():
                     if (step + 1) % accum_steps == 0:
                         scaler.step(opt); scaler.update(); opt.zero_grad()
                     
-                    # 진행 바에 현재 Loss 표시
                     if step % 5 == 0:
                         pbar.set_postfix(loss=f"{loss.item()*accum_steps:.4f}")
 
                 torch.cuda.empty_cache()
 
-            # 검증 단계
-            model.eval(); preds, trues = [], []
+            # 🔍 검증 및 5대 지표 계산
+            model.eval()
+            preds_prob = [] # 확률값 (AUC용)
+            preds_bin = []  # 0/1 라벨 (Acc, F1용)
+            trues = []
+            
             val_pbar = tqdm(loader_val, desc="   🔍 Evaluating", unit="batch", leave=False)
             
             with torch.no_grad():
@@ -125,21 +128,48 @@ def main():
                     with torch.amp.autocast('cuda'):
                         out = model(pixel_values=bx).logits if "videomae" in model_name else model(bx)
                     
-                    preds.extend(torch.softmax(out, 1)[:, 1].cpu().tolist())
+                    # Softmax로 확률 변환
+                    probs = torch.softmax(out, 1)[:, 1].cpu()
+                    preds_prob.extend(probs.tolist())
+                    
+                    # 0.5 기준으로 0(Real)과 1(Fake) 결정
+                    preds_bin.extend((probs >= 0.5).int().tolist())
                     trues.extend(by.tolist())
+                    
                     del bx, out
             
-            auc = roc_auc_score(trues, preds) if len(set(trues)) > 1 else 0.5
-            print(f"   📊 Combo {i+1} Fold 0 AUC: {auc:.4f}")
+            # 📊 지표 계산
+            try:
+                auc = roc_auc_score(trues, preds_prob) if len(set(trues)) > 1 else 0.5
+                acc = accuracy_score(trues, preds_bin)
+                f1  = f1_score(trues, preds_bin, zero_division=0)
+                prec = precision_score(trues, preds_bin, zero_division=0)
+                rec = recall_score(trues, preds_bin, zero_division=0)
+            except Exception as e:
+                print(f"   ⚠️ 지표 계산 중 오류 발생: {e}")
+                auc, acc, f1, prec, rec = 0.5, 0, 0, 0, 0
+
+            # 콘솔 출력 (가독성 좋게)
+            print(f"   📊 Result: AUC={auc:.4f} | Acc={acc:.4f} | F1={f1:.4f} | Pre={prec:.4f} | Rec={rec:.4f}")
             
-            pre_results.append({**params, "model": model_name, "fold0_auc": auc})
-            pd.DataFrame(pre_results).to_csv("preliminary_results.csv", index=False)
+            # 결과 저장
+            pre_results.append({
+                **params, 
+                "model": model_name, 
+                "auc": auc,
+                "acc": acc,
+                "f1": f1,
+                "precision": prec,
+                "recall": rec
+            })
             
-            # 메모리 해제 및 캐시 정리
+            # 실시간으로 CSV 업데이트 (혹시 멈춰도 기록 남게)
+            pd.DataFrame(pre_results).to_csv("preliminary_results_detailed.csv", index=False)
+            
             del model, opt, loader_tr, loader_val, criterion, scaler
             gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
 
-    print(f"\n{'='*30} 🏆 Preliminary Search 완료! {'='*30}")
+    print(f"\n{'='*30} 🏆 Preliminary Search 완료! ('preliminary_results_detailed.csv' 확인) {'='*30}")
 
 if __name__ == "__main__":
     main()
