@@ -25,8 +25,8 @@ def main():
     from utils import get_model
     from data_loader import get_dataloader, prepare_dataset 
 
-    # [중요] 새로 구축한 CelebV-HQ + AniPortrait 데이터셋 경로
-    BASE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\processed_cases\train\case1_original"
+    
+    BASE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\final_dataset_v2\train"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # [Rev.10] 정밀 사양서 기반 Grid Search Space 설정
