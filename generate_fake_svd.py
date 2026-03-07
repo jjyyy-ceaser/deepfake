@@ -65,7 +65,7 @@ for video_name in real_videos:
         result = pipe(
             image, decode_chunk_size=4, num_inference_steps=20, generator=generator
         )
-        export_to_video(result.frames[0], save_path, fps=7)
+        export_to_video(result.frames[0], save_path, fps=25)
         
         # 🧹 다음 영상 생성 전 VRAM 찌꺼기 완벽 제거
         del result, image
