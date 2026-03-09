@@ -1,2 +1,0 @@
-lr,dropout,model,fold0_auc
-0.001,0.2,xception,0.9748263888888888

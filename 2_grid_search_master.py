@@ -1,175 +1,136 @@
 import os
-import multiprocessing
-import itertools
-import pandas as pd
-import gc
+
+# 🔧 [Windows 경로 오류 해결] 캐시 경로를 짧은 곳으로 강제 변경
+# 이 코드는 반드시 다른 torch/transformers import보다 위에 있어야 합니다.
+os.environ['HF_HOME'] = r'C:\hf_cache'
+os.environ['TORCH_HOME'] = r'C:\torch_cache'
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import pandas as pd
+import numpy as np
+import itertools
 from sklearn.model_selection import GroupKFold
-# -----------------------------------------------------------------------------
-# 📊 [핵심 수정] 5대 평가지표 모두 import
-# -----------------------------------------------------------------------------
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix, roc_curve
 from tqdm import tqdm
 
-def get_optimizer(model, model_name, lr, weight_decay, layer_decay=1.0):
+from utils import get_model
+from data_loader import get_dataloader, prepare_dataset
+
+# ---------------------------------------------------------
+# 🛠️ [7절/10.3절] 고급 데이터 증강 (Mixup & CutMix)
+# ---------------------------------------------------------
+def apply_aug(bx, by, alpha=0.2):
+    """Mixup/CutMix 50:50 확률 적용"""
+    if np.random.rand() > 0.5: # Mixup
+        lam = np.random.beta(alpha, alpha)
+        idx = torch.randperm(bx.size(0)).to(bx.device)
+        return lam * bx + (1 - lam) * bx[idx], by, by[idx], lam
+    else: # CutMix
+        lam = np.random.beta(alpha, alpha)
+        idx = torch.randperm(bx.size(0)).to(bx.device)
+        W, H = bx.size(2), bx.size(3)
+        cut_rat = np.sqrt(1. - lam)
+        cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
+        cx, cy = np.random.randint(W), np.random.randint(H)
+        x1, y1 = np.clip(cx - cut_w // 2, 0, W), np.clip(cy - cut_h // 2, 0, H)
+        x2, y2 = np.clip(cx + cut_w // 2, 0, W), np.clip(cy + cut_h // 2, 0, H)
+        bx[:, :, x1:x2, y1:y2] = bx[idx, :, x1:x2, y1:y2]
+        lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
+        return bx, by, by[idx], lam
+
+# ---------------------------------------------------------
+# 🛠️ [9-2절] Layer-wise LR Decay Optimizer
+# ---------------------------------------------------------
+def get_optimizer(model, model_name, lr, layer_decay=1.0):
     if "videomae" in model_name and layer_decay < 1.0:
-        params = [{'params': p, 'lr': lr * layer_decay if "videomae" in n else lr} for n, p in model.named_parameters()]
-        return optim.AdamW(params, weight_decay=weight_decay)
-    return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        params = []
+        for n, p in model.named_parameters():
+            # Encoder 레이어에 decay 적용 (약식)
+            ld = layer_decay if "encoder.layer" in n else 1.0
+            params.append({"params": p, "lr": lr * ld})
+        return optim.AdamW(params, weight_decay=0.01)
+    return optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
-def main():
-    multiprocessing.freeze_support()
-    os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
-    
-    from utils import get_model
-    from data_loader import get_dataloader, prepare_dataset 
+def calculate_iso_metrics(trues, bins, probs):
+    tn, fp, fn, tp = confusion_matrix(trues, bins).ravel()
+    apcer = fn / (tp + fn) if (tp + fn) > 0 else 0.0
+    bpcer = fp / (tn + fp) if (tn + fp) > 0 else 0.0
+    fpr, tpr, _ = roc_curve(trues, probs)
+    fnr = 1 - tpr
+    eer = fpr[np.nanargmin(np.absolute(fnr - fpr))]
+    return apcer, bpcer, eer
 
-    # ✅ 경로가 맞는지 마지막으로 확인하세요! (split_data.py 결과 경로)
-    BASE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\final_dataset_v2\train"
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---------------------------------------------------------
+# 📊 [9절] 그리드 탐색 메인
+# ---------------------------------------------------------
+GRID_CONFIGS = {
+    "xception": {"search": {"lr": [1e-3, 1e-4, 1e-5], "dropout": [0.2, 0.4, 0.6]}, "bs": 32},
+    # "swin":     {"search": {"lr": [1e-4, 5e-5, 1e-5], "weight_decay": [0.01, 0.05, 0.1]}, "bs": 16},
+    # "r3d":      {"search": {"lr": [1e-3, 5e-4, 1e-4], "window_size": [12, 16]}, "bs": 16},
+    # "videomae": {"search": {"lr": [5e-4, 1e-4], "layer_decay": [0.65, 0.75, 0.85]}, "bs": 4, "accum": 4},
+    # "hybrid":   {"search": {"lr": [1e-3, 5e-4], "seq_len": [16, 25], "dropout": [0.4, 0.7]}, "bs": 16}
+}
 
-    GRID_CONFIGS = {
-        "xception": {
-            "fixed": {"bs": 64}, 
-            "search": {"lr": [1e-3, 5e-4, 1e-4], "dropout": [0.2, 0.35, 0.5]}
-        },
-        "swin": {
-            "fixed": {"bs": 64}, 
-            "search": {"lr": [1e-4, 5e-5, 1e-5], "weight_decay": [0.01, 0.03, 0.05]}
-        },
-        "r3d": {
-            "fixed": {"bs": 16}, 
-            "search": {"lr": [1e-3, 5e-4, 1e-4], "sampling": ["uniform", "dense"]}
-        },
-        "videomae": {
-            "fixed": {"bs": 4, "accum": 4}, 
-            "search": {"lr": [5e-4, 1e-4], "layer_decay": [0.65, 0.7, 0.75]}
-        },
-        "hybrid": {
-            "fixed": {"bs": 32}, 
-            "search": {"lr": [1e-3, 5e-4, 1e-4], "dropout": [0.3, 0.4, 0.5]}
-        }
-    }
+TRAIN_ROOT = r"C:\Users\leejy\Desktop\test_experiment\dataset\final_dataset_v2\train"
+SAVE_DIR = r"C:\Users\leejy\Desktop\test_experiment\results"
+DEVICE = torch.device("cuda")
 
-    print(f"🚀 데이터 로드 중: {BASE_DIR}")
-    # -------------------------------------------------------------------------
-    # ⚠️ 만약 여기서 FileNotFoundError가 뜨면 BASE_DIR 경로를 다시 확인해주세요.
-    # -------------------------------------------------------------------------
-    files, labels, groups = prepare_dataset(BASE_DIR)
+def run_grid_search():
+    files, labels, groups = prepare_dataset(TRAIN_ROOT)
     gkf = GroupKFold(n_splits=5)
-    
     fold0_idx, fold0_val_idx = next(gkf.split(files, labels, groups=groups))
     
-    pre_results = []
+    results = []
 
     for model_name, cfg in GRID_CONFIGS.items():
         keys, values = zip(*cfg["search"].items())
         combos = [dict(zip(keys, v)) for v in itertools.product(*values)]
         
-        print(f"\n{'='*30} 🤖 {model_name.upper()} Preliminary Search {'='*30}")
-        
-        for i, params in enumerate(combos):
-            print(f"\n▶ Combo [{i+1}/{len(combos)}]: {params}")
+        for params in combos:
+            print(f"\n🔍 [Grid Search] {model_name.upper()} | Params: {params}")
             
-            tr_f, tr_l = [files[k] for k in fold0_idx], [labels[k] for k in fold0_idx]
-            val_f, val_l = [files[k] for k in fold0_val_idx], [labels[k] for k in fold0_val_idx]
-            
-            samp = params.get("sampling", "uniform")
-            loader_tr = get_dataloader(tr_f, tr_l, model_name, cfg["fixed"]["bs"], sampling=samp)
-            loader_val = get_dataloader(val_f, val_l, model_name, cfg["fixed"]["bs"], sampling=samp, shuffle=False)
-            
-            model = get_model(model_name, DEVICE, dropout_rate=params.get("dropout", 0.0))
-            opt = get_optimizer(model, model_name, params["lr"], params.get("weight_decay", 0.01), params.get("layer_decay", 1.0))
-            criterion = nn.CrossEntropyLoss()
-            scaler = torch.amp.GradScaler('cuda')
-            accum_steps = cfg["fixed"].get("accum", 1)
+            frames = int(params.get("window_size", params.get("seq_len", 16)))
+            loader_tr = get_dataloader([files[i] for i in fold0_idx], [labels[i] for i in fold0_idx], 
+                                       model_name, cfg["bs"], 'train', frames)
+            loader_val = get_dataloader([files[i] for i in fold0_val_idx], [labels[i] for i in fold0_val_idx], 
+                                        model_name, cfg["bs"], 'test', frames)
 
-            # 3 Epoch 예비 학습
+            model = get_model(model_name, DEVICE, **params)
+            # 🔧 [9-2절] Decay 반영 Optimizer
+            optimizer = get_optimizer(model, model_name, params["lr"], params.get("layer_decay", 1.0))
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+            scaler = torch.amp.GradScaler('cuda')
+            accum = cfg.get("accum", 1)
+
+            # 3 Epochs 단기 탐색
             for epoch in range(3):
                 model.train()
-                pbar = tqdm(enumerate(loader_tr), total=len(loader_tr), 
-                            desc=f"   Epoch {epoch+1}/3", unit="batch", leave=False)
-                
-                for step, (bx, by) in pbar:
+                for step, (bx, by) in enumerate(tqdm(loader_tr, leave=False)):
                     bx, by = bx.to(DEVICE), by.to(DEVICE)
-                    if "r3d" in model_name: 
-                        bx = bx.permute(0, 2, 1, 3, 4)
+                    # 🔧 [7절] CutMix/Mixup 증강 적용
+                    bx_aug, y_a, y_b, lam = apply_aug(bx, by)
                     
                     with torch.amp.autocast('cuda'):
-                        out = model(pixel_values=bx).logits if "videomae" in model_name else model(bx)
-                        loss = criterion(out, by) / accum_steps
-                    
+                        out = model(pixel_values=bx_aug).logits if "videomae" in model_name else model(bx_aug)
+                        loss = (lam * criterion(out, y_a) + (1 - lam) * criterion(out, y_b)) / accum
                     scaler.scale(loss).backward()
-                    
-                    if (step + 1) % accum_steps == 0:
-                        scaler.step(opt); scaler.update(); opt.zero_grad()
-                    
-                    if step % 5 == 0:
-                        pbar.set_postfix(loss=f"{loss.item()*accum_steps:.4f}")
+                    if (step + 1) % accum == 0:
+                        scaler.step(optimizer); scaler.update(); optimizer.zero_grad()
 
-                torch.cuda.empty_cache()
-
-            # 🔍 검증 및 5대 지표 계산
-            model.eval()
-            preds_prob = [] # 확률값 (AUC용)
-            preds_bin = []  # 0/1 라벨 (Acc, F1용)
-            trues = []
-            
-            val_pbar = tqdm(loader_val, desc="   🔍 Evaluating", unit="batch", leave=False)
-            
+            model.eval(); probs, bins, trues = [], [], []
             with torch.no_grad():
-                for bx, by in val_pbar:
+                for bx, by in loader_val:
                     bx = bx.to(DEVICE)
-                    if "r3d" in model_name: 
-                        bx = bx.permute(0, 2, 1, 3, 4)
-                        
                     with torch.amp.autocast('cuda'):
                         out = model(pixel_values=bx).logits if "videomae" in model_name else model(bx)
-                    
-                    # Softmax로 확률 변환
-                    probs = torch.softmax(out, 1)[:, 1].cpu()
-                    preds_prob.extend(probs.tolist())
-                    
-                    # 0.5 기준으로 0(Real)과 1(Fake) 결정
-                    preds_bin.extend((probs >= 0.5).int().tolist())
-                    trues.extend(by.tolist())
-                    
-                    del bx, out
-            
-            # 📊 지표 계산
-            try:
-                auc = roc_auc_score(trues, preds_prob) if len(set(trues)) > 1 else 0.5
-                acc = accuracy_score(trues, preds_bin)
-                f1  = f1_score(trues, preds_bin, zero_division=0)
-                prec = precision_score(trues, preds_bin, zero_division=0)
-                rec = recall_score(trues, preds_bin, zero_division=0)
-            except Exception as e:
-                print(f"   ⚠️ 지표 계산 중 오류 발생: {e}")
-                auc, acc, f1, prec, rec = 0.5, 0, 0, 0, 0
+                    p = torch.softmax(out, 1)[:, 1].cpu().numpy()
+                    probs.extend(p); bins.extend((p>=0.5).astype(int)); trues.extend(by.numpy())
 
-            # 콘솔 출력 (가독성 좋게)
-            print(f"   📊 Result: AUC={auc:.4f} | Acc={acc:.4f} | F1={f1:.4f} | Pre={prec:.4f} | Rec={rec:.4f}")
-            
-            # 결과 저장
-            pre_results.append({
-                **params, 
-                "model": model_name, 
-                "auc": auc,
-                "acc": acc,
-                "f1": f1,
-                "precision": prec,
-                "recall": rec
-            })
-            
-            # 실시간으로 CSV 업데이트 (혹시 멈춰도 기록 남게)
-            pd.DataFrame(pre_results).to_csv("preliminary_results_detailed.csv", index=False)
-            
-            del model, opt, loader_tr, loader_val, criterion, scaler
-            gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
-
-    print(f"\n{'='*30} 🏆 Preliminary Search 완료! ('preliminary_results_detailed.csv' 확인) {'='*30}")
+            apcer, bpcer, eer = calculate_iso_metrics(trues, bins, probs)
+            results.append({**params, "model": model_name, "auc": roc_auc_score(trues, probs), "eer": eer, "apcer": apcer})
+            pd.DataFrame(results).to_csv(os.path.join(SAVE_DIR, "grid_search_results.csv"), index=False)
+            del model; torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    main()
+    run_grid_search()

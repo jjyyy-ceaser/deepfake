@@ -1,128 +1,156 @@
 import os
 import torch
-import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
-from data_loader import DeepfakeDataset, MODEL_SPECS
-from torchvision.utils import save_image
+from torchvision.utils import make_grid
+from tqdm import tqdm
+
+# 사용자 코드 import
+from data_loader import prepare_dataset, get_transforms
+from dataset import DeepfakeDataset  # 수정된 dataset 클래스
 
 # ==========================================
-# ⚙️ 설정 (실제 학습 환경과 동일하게)
+# ⚙️ 설정 (Rev.18 실험 환경 동일)
 # ==========================================
-# [중요] 아까 스플릿한 v2 폴더 경로로 설정하세요!
 BASE_DIR = r"C:\Users\leejy\Desktop\test_experiment\dataset\final_dataset_v2\train"
 SAVE_DIR = "debug_samples_v2"
-BATCH_SIZE = 2 # 디버그니까 작게
+BATCH_SIZE = 4 
 
-# 학습 코드와 동일한 모델별 설정
+# 모델별 설정
 GRID_CONFIGS = {
-    "xception": {"fixed": {"bs": 16}, "type": "spatial"},
-    "swin":     {"fixed": {"bs": 16}, "type": "spatial"},
-    "r3d":      {"fixed": {"bs": 16}, "type": "temporal"},
-    "videomae": {"fixed": {"bs": 4},  "type": "temporal"},
-    "hybrid":   {"fixed": {"bs": 16}, "type": "temporal"}
+    "xception": {"type": "spatial",  "input_size": 224},
+    "swin":     {"type": "spatial",  "input_size": 224},
+    "r3d":      {"type": "temporal", "input_size": 112},
+    "videomae": {"type": "temporal", "input_size": 224},
+    "hybrid":   {"type": "temporal", "input_size": 224}
 }
 
-def denormalize(tensor, mean, std):
-    """ 정규화된 텐서를 다시 이미지로 복구 (시각화용) """
-    tensor = tensor.clone()
-    for t, m, s in zip(tensor, mean, std):
-        t.mul_(s).add_(m)
-    return tensor
+def check_black_screen(tensor):
+    """텐서의 표준편차(std)를 계산하여 단색 화면인지 감지"""
+    std = torch.std(tensor)
+    if std < 0.01: # 거의 단색
+        return True, std.item()
+    return False, std.item()
+
+def denormalize(tensor, model_name):
+    """모델별 정규화 역연산"""
+    if "r3d" in model_name:
+        mean = torch.tensor([0.432, 0.394, 0.376]).view(1, 3, 1, 1)
+        std = torch.tensor([0.228, 0.221, 0.216]).view(1, 3, 1, 1)
+    else:
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    return tensor * std + mean
+
+def save_debug_batch(inputs, model_name, save_path):
+    """배치 이미지 저장"""
+    # 1. 차원 정리 (시각화를 위해 Image 형태로 변환)
+    # VideoMAE/Hybrid: (B, T, C, H, W) -> T번째 프레임 추출
+    # R3D: (B, C, T, H, W) -> T번째 프레임 추출
+    
+    if inputs.dim() == 5: 
+        if inputs.shape[1] == 3: # (B, C, T, H, W) -> R3D
+            img_tensor = inputs[:, :, 8, :, :] 
+        else: # (B, T, C, H, W) -> Others
+            img_tensor = inputs[:, 8, :, :, :] 
+    else: # (B, C, H, W) -> Spatial
+        img_tensor = inputs
+
+    # 2. 역정규화
+    img_tensor = denormalize(img_tensor.cpu(), model_name)
+    img_tensor = torch.clamp(img_tensor, 0, 1)
+    
+    # 3. 저장
+    grid = make_grid(img_tensor, nrow=2, padding=2)
+    np_img = grid.permute(1, 2, 0).numpy()
+    
+    plt.figure(figsize=(10, 10))
+    plt.imshow(np_img)
+    plt.axis('off')
+    plt.title(f"Model: {model_name} (Sample Frame)")
+    plt.savefig(save_path)
+    plt.close()
 
 def main():
-    print(f"🚀 [Final Debug] 데이터 로더 및 입력 차원 정밀 점검 시작")
-    print(f"📂 데이터 경로: {BASE_DIR}")
-    
-    if not os.path.exists(BASE_DIR):
-        print(f"❌ 오류: 데이터 경로가 존재하지 않습니다. split_data.py를 먼저 실행했는지 확인하세요.")
-        return
-
+    print(f"🚀 [Debug] 데이터 로더 V2 점검 (호환성 패치 완료)")
     os.makedirs(SAVE_DIR, exist_ok=True)
-
-    # 더미 데이터 리스트 생성 (경로 확인용)
-    import glob
-    real_files = glob.glob(os.path.join(BASE_DIR, "real", "*.mp4"))
-    fake_files = glob.glob(os.path.join(BASE_DIR, "fake", "*.mp4"))
     
-    if not real_files or not fake_files:
-        print(f"❌ 오류: real({len(real_files)}) 또는 fake({len(fake_files)}) 파일이 부족합니다.")
+    # 1. 파일 리스트 준비
+    if not os.path.exists(BASE_DIR):
+        print(f"❌ 데이터 경로 없음: {BASE_DIR}")
         return
-
-    # 테스트용 파일 리스트 (각각 2개씩만)
-    sample_files = real_files[:2] + fake_files[:2]
-    sample_labels = [0, 0, 1, 1]
-
-    # ====================================================
-    # 🔍 모든 모델 타입 순회하며 차원 점검
-    # ====================================================
-    for model_name, cfg in GRID_CONFIGS.items():
-        print(f"\n--------------------------------------------------")
-        print(f"🔍 [Check] 모델: {model_name.upper()}")
         
-        # 1. 데이터셋 & 로더 생성
-        ds = DeepfakeDataset(sample_files, sample_labels, model_name=model_name, sampling='uniform')
-        loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+    files, labels, _ = prepare_dataset(BASE_DIR)
+    print(f"📂 전체 파일 수: {len(files)} -> 디버깅용 8개 샘플링")
+    
+    # 샘플링
+    sample_files = files[:4] + files[-4:]
+    sample_labels = labels[:4] + labels[-4:]
+
+    # 2. 모델별 순회 점검
+    for model_name, cfg in GRID_CONFIGS.items():
+        print(f"\n{'='*40}")
+        print(f"🔍 검사 모델: {model_name.upper()}")
+        print(f"{'='*40}")
         
         try:
-            # 2. 배치 하나 뽑기
-            inputs, labels = next(iter(loader))
+            # 🔧 [수정된 부분] model_type 대신 model_name 전달
+            ds = DeepfakeDataset(
+                file_paths=sample_files,
+                labels=sample_labels,
+                model_name=model_name,  # 👈 여기가 핵심 수정사항!
+                mode='train',
+                transform=get_transforms(model_name),
+                window_size=16
+            )
             
-            # 3. 2_grid_search_master.py와 똑같은 전처리 로직 적용 (핵심!)
-            final_input = inputs
-            if "r3d" in model_name:
-                # R3D는 (B, T, C, H, W) -> (B, C, T, H, W)로 변환
-                final_input = inputs.permute(0, 2, 1, 3, 4)
+            loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+            inputs, targets = next(iter(loader))
             
-            # 4. 결과 출력
-            shape = final_input.shape
-            print(f"   ✅ Input Shape: {shape}")
-            print(f"   ✅ Label Shape: {labels.shape}")
+            # -------------------------------------------------
+            # ✅ 체크포인트 1: 입력 차원 (Shape) 검증
+            # -------------------------------------------------
+            print(f"   📐 Input Shape: {inputs.shape}")
             
-            # 5. 모델별 정상 규격 판별
-            is_pass = False
-            
-            if model_name in ["xception", "swin"]:
-                # (Batch, 3, 224, 224)
-                if len(shape) == 4 and shape[2] == 224: is_pass = True
+            is_valid = False
+            # Spatial: (B, 3, H, W)
+            if cfg['type'] == 'spatial' and inputs.dim() == 4:
+                is_valid = True
+            # Temporal (R3D): (B, C, T, H, W) -> dataset.py가 permute 해줌
+            elif model_name == 'r3d' and inputs.shape[1] == 3 and inputs.dim() == 5:
+                is_valid = True
+            # Temporal (Others): (B, T, C, H, W) -> 원본 유지
+            elif model_name in ['videomae', 'hybrid'] and inputs.shape[2] == 3 and inputs.dim() == 5:
+                is_valid = True
                 
-            elif model_name == "r3d":
-                # (Batch, 3, 16, 112, 112) -> Permute 적용됨
-                if len(shape) == 5 and shape[1] == 3 and shape[3] == 112: is_pass = True
-                
-            elif model_name in ["videomae", "hybrid"]:
-                # (Batch, 16, 3, 224, 224) -> Permute 없음
-                if len(shape) == 5 and shape[1] == 16 and shape[3] == 224: is_pass = True
-            
-            if is_pass:
-                print(f"   🎉 [PASS] 규격 일치 확인완료")
+            if is_valid:
+                print(f"   ✅ [PASS] 차원 규격 정상")
             else:
-                print(f"   ❌ [FAIL] 규격 불일치! (사양서 확인 필요)")
+                print(f"   ❌ [FAIL] 차원 규격 이상 발생! (dataset.py 확인 필요)")
 
-            # 6. 이미지 저장 (시각적 확인)
-            # 첫 번째 배치의 첫 번째 샘플 저장
-            spec = ds.spec
-            if len(shape) == 5: # 비디오 (T, C, H, W) or (C, T, H, W)
-                # 시각화를 위해 (T, C, H, W)로 통일
-                viz_tensor = inputs[0] 
-                viz_tensor = denormalize(viz_tensor, spec['mean'], spec['std'])
-                save_path = os.path.join(SAVE_DIR, f"{model_name}_sample.jpg")
-                save_image(viz_tensor, save_path, nrow=4) # 4x4 그리드로 저장
-            else: # 이미지 (C, H, W)
-                viz_tensor = inputs[0]
-                viz_tensor = denormalize(viz_tensor, spec['mean'], spec['std'])
-                save_path = os.path.join(SAVE_DIR, f"{model_name}_sample.jpg")
-                save_image(viz_tensor, save_path)
+            # -------------------------------------------------
+            # ✅ 체크포인트 2: 검정 화면 감지
+            # -------------------------------------------------
+            is_black, std_val = check_black_screen(inputs.float())
+            if is_black:
+                print(f"   💀 [CRITICAL] 검정 화면 의심 (std: {std_val:.6f})")
+            else:
+                print(f"   ✅ [PASS] 이미지 정보량 정상 (std: {std_val:.4f})")
+
+            # -------------------------------------------------
+            # ✅ 체크포인트 3: 시각화 저장
+            # -------------------------------------------------
+            save_path = os.path.join(SAVE_DIR, f"debug_{model_name}.jpg")
+            save_debug_batch(inputs, model_name, save_path)
+            print(f"   💾 시각화 저장: {save_path}")
             
-            print(f"   💾 샘플 저장: {save_path}")
-
         except Exception as e:
-            print(f"   ❌ [ERROR] 로딩 실패: {e}")
+            print(f"   ❌ [ERROR] {model_name} 로딩 중 치명적 오류: {e}")
             import traceback
             traceback.print_exc()
 
-    print(f"\n--------------------------------------------------")
-    print(f"✅ 모든 점검 완료. '{SAVE_DIR}' 폴더에서 이미지를 확인하세요.")
+    print(f"\n✅ 모든 디버깅 완료. '{SAVE_DIR}' 폴더 확인")
 
 if __name__ == "__main__":
     main()
