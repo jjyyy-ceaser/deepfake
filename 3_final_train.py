@@ -23,11 +23,11 @@ from data_loader import get_dataloader, prepare_dataset
 # ⚙️ [최종 확정] 최적 하이퍼파라미터
 # ======================================================
 BEST_PARAMS = {
-    # "xception": {"lr": 1e-3, "dropout": 0.4, "bs": 32},
-    # "swin":     {"lr": 1e-4, "weight_decay": 0.1, "bs": 16},
+    "xception": {"lr": 1e-3, "dropout": 0.4, "bs": 32},
+    "swin":     {"lr": 1e-4, "weight_decay": 0.1, "bs": 16},
     "r3d":      {"lr": 1e-4, "window_size": 12, "bs": 16},
     "videomae": {"lr": 1e-4, "layer_decay": 0.65, "bs": 4, "accum": 4},
-    "hybrid":   {"lr": 1e-3, "seq_len": 25, "dropout": 0.7, "bs": 8, "accum": 2}
+    # "hybrid":   {"lr": 1e-3, "seq_len": 25, "dropout": 0.7, "bs": 8, "accum": 2}
 }
 
 TRAIN_ROOT = r"C:\Users\leejy\Desktop\test_experiment\dataset\final_dataset_v2\train"
